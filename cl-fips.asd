@@ -19,7 +19,8 @@
                              (:file "wire")
                              (:file "fips-noise")
                              (:file "fmp")
-                             (:file "identity"))))
+                             (:file "identity")
+                             (:file "rekey"))))
   :in-order-to ((test-op (test-op "cl-fips/test"))))
 
 (defsystem "cl-fips/test"
@@ -27,5 +28,7 @@
   :depends-on ("cl-fips")
   :serial t
   :components ((:module "test" :serial t
-                :components ((:file "test") (:file "noise-test") (:file "frame-test"))))
+                :components ((:file "test") (:file "noise-test") (:file "frame-test")
+                             (:file "try-read-test")
+                             (:file "rekey-test"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-fips.test '#:run-all)))

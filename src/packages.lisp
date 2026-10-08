@@ -16,7 +16,21 @@
            #:+flag-key-epoch+ #:+flag-ce+ #:+flag-sp+ #:+inner-header-size+
            #:fmp-seal-frame #:fmp-open-frame #:fmp-frame-payload-len-ok-p
            ;; identity (identity.lisp)
-           #:node-addr #:fips-address #:fips-address-string))
+           #:node-addr #:fips-address #:fips-address-string
+           ;; FMP link rekey (rekey.lisp)
+           #:+drain-window-secs+ #:+rekey-dampening-secs+ #:+rekey-jitter-secs+
+           #:rekey-config #:make-rekey-config #:rekey-config-after-secs
+           #:rekey-config-after-messages #:rekey-config-pending-hold-ms #:rekey-config-enabled
+           #:build-msg1 #:build-msg2 #:parse-msg1 #:parse-msg2
+           #:node-addr< #:rekey-tie-break-winner-p
+           #:fmp-link #:make-link #:rekey-snapshot #:make-rekey-snapshot #:rekey-decide
+           #:link-snapshot #:link-tick #:link-send #:link-receive
+           #:link-cutover #:link-adopt-pending #:link-complete-drain #:link-retire-pending
+           #:link-abandon-rekey #:link-initiate-rekey
+           #:link-session #:link-previous-session #:link-pending-session #:link-pending-role
+           #:link-our-index #:link-their-index #:link-previous-our-index
+           #:link-pending-our-index #:link-k-bit #:link-rekey-in-progress
+           #:link-our-addr #:link-peer-addr #:link-drain-started #:link-config))
 
 (defpackage #:cl-fips.test
   (:use #:common-lisp #:cl-fips #:natrium.noise #:secp256k1-fast.ecdh)

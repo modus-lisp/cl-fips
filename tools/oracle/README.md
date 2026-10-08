@@ -9,3 +9,12 @@ it byte-for-byte.
 - Only the Noise module is vendored.  The full upstream crate needs libdbus for
   its BLE transport.
 - `cargo build --release && ./target/release/oracle ik|xk`
+- `src/fmp_wire.rs` copies parts of upstream `src/proto/fmp/wire.rs` verbatim
+  (line ranges in its header), including the msg1/msg2 packets a link rekey
+  travels in.
+- Interactive modes (documented at the top of `src/bin/oracle.rs`):
+  `verify-ik-*`, `verify-xk-*`, `verify-frame`, `node-addr`,
+  `verify-xk-responder-retry[-plain]` (a corrupted msg3 delivery followed by
+  the genuine one) and `verify-rekey` (one side of an FMP link rekey; its rekey
+  driver transliterates upstream's `peer/active.rs` and
+  `node/dataplane/encrypted.rs`, which are not vendored).

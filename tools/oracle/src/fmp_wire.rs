@@ -1,7 +1,9 @@
 //! FMP established-frame wire codec, copied VERBATIM from jmcorgan/fips @
 //! 57bc510, src/proto/fmp/wire.rs: lines 191-392 (constants, CommonPrefix,
-//! EncryptedHeader) and 548-605 (build_established_header, build_encrypted,
-//! prepend_inner_header, strip_inner_header).  Only the imports and the
+//! EncryptedHeader), 393-547 (Msg1Header, Msg2Header, build_msg1,
+//! build_msg2 -- the packets a link rekey travels in) and 548-605
+//! (build_established_header, build_encrypted, prepend_inner_header,
+//! strip_inner_header).  Only the imports and the
 //! minimal `SessionIndex` stand-in below are not upstream text (upstream's is
 //! src/utils/index.rs, a u32 newtype with the same LE byte conversions); the
 //! handshake/Disconnect halves of that file are not needed and not copied.
@@ -287,4 +289,159 @@ pub fn strip_inner_header(plaintext: &[u8]) -> Option<(u32, &[u8])> {
     }
     let timestamp = u32::from_le_bytes([plaintext[0], plaintext[1], plaintext[2], plaintext[3]]);
     Some((timestamp, &plaintext[4..]))
+}
+
+// ============================================================================
+// Msg1 Header
+// ============================================================================
+
+/// Parsed Noise IK message 1 header (phase 0x1).
+///
+/// Wire format (114 bytes):
+/// ```text
+/// [0x01][0x00][payload_len:2 LE][sender_idx:4 LE][noise_msg1:106]
+/// ```
+#[derive(Clone, Debug)]
+pub struct Msg1Header {
+    /// Session index chosen by the sender (becomes receiver_idx for responses).
+    pub sender_idx: SessionIndex,
+    /// Offset where Noise msg1 payload begins.
+    pub noise_msg1_offset: usize,
+}
+
+impl Msg1Header {
+    /// Parse a msg1 header from packet data.
+    ///
+    /// Returns None if the packet has wrong size or version/phase.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() != MSG1_WIRE_SIZE {
+            return None;
+        }
+
+        let version = data[0] >> 4;
+        let phase = data[0] & 0x0F;
+
+        if version != FMP_VERSION || phase != PHASE_MSG1 {
+            return None;
+        }
+
+        // flags must be zero during handshake
+        if data[1] != 0 {
+            return None;
+        }
+
+        let sender_idx = SessionIndex::from_le_bytes([data[4], data[5], data[6], data[7]]);
+
+        Some(Self {
+            sender_idx,
+            noise_msg1_offset: COMMON_PREFIX_SIZE + 4, // 8
+        })
+    }
+
+    /// Get the Noise msg1 payload from the original packet.
+    #[cfg(test)]
+    pub fn noise_msg1<'a>(&self, data: &'a [u8]) -> &'a [u8] {
+        &data[self.noise_msg1_offset..]
+    }
+}
+
+// ============================================================================
+// Msg2 Header
+// ============================================================================
+
+/// Parsed Noise IK message 2 header (phase 0x2).
+///
+/// Wire format (69 bytes):
+/// ```text
+/// [0x02][0x00][payload_len:2 LE][sender_idx:4 LE][receiver_idx:4 LE][noise_msg2:57]
+/// ```
+#[derive(Clone, Debug)]
+pub struct Msg2Header {
+    /// Session index chosen by the responder.
+    pub sender_idx: SessionIndex,
+    /// Echo of the initiator's sender_idx from msg1.
+    pub receiver_idx: SessionIndex,
+    /// Offset where Noise msg2 payload begins.
+    pub noise_msg2_offset: usize,
+}
+
+impl Msg2Header {
+    /// Parse a msg2 header from packet data.
+    ///
+    /// Returns None if the packet has wrong size or version/phase.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() != MSG2_WIRE_SIZE {
+            return None;
+        }
+
+        let version = data[0] >> 4;
+        let phase = data[0] & 0x0F;
+
+        if version != FMP_VERSION || phase != PHASE_MSG2 {
+            return None;
+        }
+
+        // flags must be zero during handshake
+        if data[1] != 0 {
+            return None;
+        }
+
+        let sender_idx = SessionIndex::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let receiver_idx = SessionIndex::from_le_bytes([data[8], data[9], data[10], data[11]]);
+
+        Some(Self {
+            sender_idx,
+            receiver_idx,
+            noise_msg2_offset: COMMON_PREFIX_SIZE + 4 + 4, // 12
+        })
+    }
+
+    /// Get the Noise msg2 payload from the original packet.
+    #[cfg(test)]
+    pub fn noise_msg2<'a>(&self, data: &'a [u8]) -> &'a [u8] {
+        &data[self.noise_msg2_offset..]
+    }
+}
+
+// ============================================================================
+// Serialization Helpers
+// ============================================================================
+
+/// Build a wire-format msg1 packet.
+///
+/// Format: `[0x01][0x00][payload_len:2 LE][sender_idx:4 LE][noise_msg1:106]`
+pub fn build_msg1(sender_idx: SessionIndex, noise_msg1: &[u8]) -> Vec<u8> {
+    debug_assert_eq!(noise_msg1.len(), HANDSHAKE_MSG1_SIZE);
+
+    let payload_len = (4 + noise_msg1.len()) as u16; // sender_idx + noise_msg1
+
+    let mut packet = Vec::with_capacity(MSG1_WIRE_SIZE);
+    packet.push(CommonPrefix::ver_phase_byte(FMP_VERSION, PHASE_MSG1));
+    packet.push(0x00); // flags must be zero
+    packet.extend_from_slice(&payload_len.to_le_bytes());
+    packet.extend_from_slice(&sender_idx.to_le_bytes());
+    packet.extend_from_slice(noise_msg1);
+    packet
+}
+
+/// Build a wire-format msg2 packet.
+///
+/// Format: `[0x02][0x00][payload_len:2 LE][sender_idx:4 LE][receiver_idx:4 LE][noise_msg2:57]`
+pub fn build_msg2(
+    sender_idx: SessionIndex,
+    receiver_idx: SessionIndex,
+    noise_msg2: &[u8],
+) -> Vec<u8> {
+    debug_assert_eq!(noise_msg2.len(), HANDSHAKE_MSG2_SIZE);
+
+    let payload_len = (4 + 4 + noise_msg2.len()) as u16; // sender + receiver + noise
+
+    let mut packet = Vec::with_capacity(MSG2_WIRE_SIZE);
+    packet.push(CommonPrefix::ver_phase_byte(FMP_VERSION, PHASE_MSG2));
+    packet.push(0x00); // flags must be zero
+    packet.extend_from_slice(&payload_len.to_le_bytes());
+    packet.extend_from_slice(&sender_idx.to_le_bytes());
+    packet.extend_from_slice(&receiver_idx.to_le_bytes());
+    packet.extend_from_slice(noise_msg2);
+    packet
 }

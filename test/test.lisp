@@ -83,5 +83,7 @@
   (test-frame-local)                    ; frame-test.lisp
   (test-frame-oracle)
   (test-identity)                       ; frame-test.lisp
+  (test-try-read)                       ; try-read-test.lisp
+  (test-rekey)                          ; rekey-test.lisp
   (format t "~&~d checks, ~d failures~%" *checks* *failures*)
   (zerop *failures*))
