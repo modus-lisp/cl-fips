@@ -1,0 +1,19 @@
+[package]
+name = "fips-oracle"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Reference oracle for cl-fips.  src/noise/ is copied VERBATIM from
+# jmcorgan/fips at commit 57bc510 (MIT).  Only the Noise module is vendored:
+# the full crate needs libdbus for its BLE transport, which this box lacks.
+# Versions match upstream's Cargo.toml.
+[dependencies]
+secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
+sha2 = { version = "0.11", features = ["zeroize"] }
+hkdf = "0.13"
+ring = "0.17"
+zeroize = { version = "1.9", features = ["zeroize_derive"] }
+rand = "0.10.1"
+thiserror = "2.0"
+hex = "0.4"
