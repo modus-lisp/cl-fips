@@ -76,6 +76,12 @@
   (test-fmp-established)
   (test-fsp)
   (test-noise-local)                    ; noise-test.lisp
+  (test-xk-local)
+  (test-replay-window)
+  (test-session-replay)
   (test-noise-oracle)
+  (test-frame-local)                    ; frame-test.lisp
+  (test-frame-oracle)
+  (test-identity)                       ; frame-test.lisp
   (format t "~&~d checks, ~d failures~%" *checks* *failures*)
   (zerop *failures*))

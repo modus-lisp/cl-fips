@@ -10,7 +10,13 @@
            #:+fmp-established-header-size+ #:+fsp-header-size+ #:+aead-tag-size+
            ;; the FIPS suite (fips-noise.lisp); the protocol is natrium.noise's
            #:generate-keypair #:normalize-for-premessage
-           #:fips-make-ik-initiator #:fips-make-ik-responder))
+           #:fips-make-ik-initiator #:fips-make-ik-responder
+           #:fips-make-xk-initiator #:fips-make-xk-responder
+           ;; FMP established frames (fmp.lisp)
+           #:+flag-key-epoch+ #:+flag-ce+ #:+flag-sp+ #:+inner-header-size+
+           #:fmp-seal-frame #:fmp-open-frame #:fmp-frame-payload-len-ok-p
+           ;; identity (identity.lisp)
+           #:node-addr #:fips-address #:fips-address-string))
 
 (defpackage #:cl-fips.test
   (:use #:common-lisp #:cl-fips #:natrium.noise #:secp256k1-fast.ecdh)

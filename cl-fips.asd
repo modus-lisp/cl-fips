@@ -17,7 +17,9 @@
   :components ((:module "src" :serial t
                 :components ((:file "packages")
                              (:file "wire")
-                             (:file "fips-noise"))))
+                             (:file "fips-noise")
+                             (:file "fmp")
+                             (:file "identity"))))
   :in-order-to ((test-op (test-op "cl-fips/test"))))
 
 (defsystem "cl-fips/test"
@@ -25,5 +27,5 @@
   :depends-on ("cl-fips")
   :serial t
   :components ((:module "test" :serial t
-                :components ((:file "test") (:file "noise-test"))))
+                :components ((:file "test") (:file "noise-test") (:file "frame-test"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-fips.test '#:run-all)))
