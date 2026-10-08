@@ -30,7 +30,17 @@
            #:link-session #:link-previous-session #:link-pending-session #:link-pending-role
            #:link-our-index #:link-their-index #:link-previous-our-index
            #:link-pending-our-index #:link-k-bit #:link-rekey-in-progress
-           #:link-our-addr #:link-peer-addr #:link-drain-started #:link-config))
+           #:link-our-addr #:link-peer-addr #:link-drain-started #:link-config
+           ;; FMP over a byte stream (link.lisp)
+           #:+default-stream-mtu+ #:link-error #:link-error-reason #:link-error-detail
+           #:link-error-fatal-p #:make-byte-port #:byte-port-close #:byte-port-closed
+           #:fmp-packet-remaining #:read-fmp-packet #:write-fmp-packet #:deadline-after-ms
+           #:stream-link #:stream-link-initiate #:stream-link-accept
+           #:stream-link-send #:stream-link-receive #:stream-link-close
+           #:stream-link-port #:stream-link-role #:stream-link-session
+           #:stream-link-our-index #:stream-link-their-index #:stream-link-handshake-hash
+           #:stream-link-remote-static #:stream-link-remote-epoch #:stream-link-mtu
+           #:random-session-index #:make-octet-source-port))
 
 (defpackage #:cl-fips.test
   (:use #:common-lisp #:cl-fips #:natrium.noise #:secp256k1-fast.ecdh)

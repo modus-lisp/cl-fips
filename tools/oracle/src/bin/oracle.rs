@@ -97,6 +97,40 @@
 //!                                   oracle_node_addr, lisp_node_addr
 //!         end
 //!
+//!   oracle serve-tcp
+//!       Upstream IK RESPONDER over REAL TCP.  Listens on 127.0.0.1, an
+//!       ephemeral port; prints responder_static, port and `ready=1`.  Accepts
+//!       one connection and reads packets with read_fmp_packet (framing.rs,
+//!       transliterated to blocking I/O; MTU 1400): the msg1 is parsed with
+//!       Msg1Header::parse and read with read_message_1, and the msg2 written
+//!       with write_message_2 + build_msg2.  Prints result (or `error=`),
+//!       handshake_hash, initiator_static, remote_epoch, lisp_receiver_idx and
+//!       oracle_receiver_idx, then the stream exchange below.
+//!
+//!   oracle dial-tcp
+//!       Upstream IK INITIATOR over REAL TCP.  stdin line 1: the port (decimal)
+//!       to dial on 127.0.0.1; line 2: the responder's static key (hex).
+//!       Writes build_msg1, reads the msg2 packet with read_fmp_packet +
+//!       Msg2Header::parse (receiver_idx must be ours) + read_message_2, prints
+//!       the same fields as serve-tcp, then the stream exchange.
+//!
+//!       The stream exchange (both modes): verify-frame's three frames, printed
+//!       as frame_N / _flags / _timestamp / _message and `frames_ready=1`, then
+//!       written to the socket.  Then every packet read is opened as
+//!       verify-frame opens a line (frame_receiver_idx, frame_counter,
+//!       frame_flags, frame_timestamp, frame_payload_len_ok, frame_message,
+//!       `frame_result=ok`, or `error=` + `frame_result=error`); each opened
+//!       frame is ECHOED back sealed on the session (same message, timestamp
+//!       + 1, flags 0).  The first read_fmp_packet error ends it, printed as
+//!       `stream_end=<StreamError>` and `frames_received=N`.
+//!
+//!   oracle dial-raw
+//!       A raw TCP peer for malformed-input tests.  One command per stdin line:
+//!       `connect <port>`, `send <hex>`, `sleep <ms>`, `shutdown` (our write
+//!       half), `wait-close <ms>` (read and discard until the peer closes or
+//!       <ms> pass, printing peer_closed=1|0, close_kind=eof|reset|timeout,
+//!       waited_ms, bytes_received), `end`.  Each command prints `ok=<cmd>`.
+//!
 //!   oracle node-addr
 //!       For each input line (a 33-byte compressed key, hex) prints node_addr
 //!       (upstream identity/node_addr.rs NodeAddr::from_pubkey over the x-only
@@ -112,8 +146,11 @@ use fips_oracle::fmp_wire::{
     EncryptedHeader, ESTABLISHED_HEADER_SIZE, FLAG_CE, FLAG_KEY_EPOCH, FLAG_SP, SessionIndex,
     build_encrypted, build_established_header, prepend_inner_header, strip_inner_header,
 };
-use fips_oracle::noise::{HandshakeState};
-use std::io::{BufRead, Write};
+use fips_oracle::framing::read_fmp_packet;
+use fips_oracle::noise::{HandshakeState, NoiseSession};
+use std::io::{BufRead, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::time::{Duration, Instant};
 use rand::Rng;
 use secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey};
 
@@ -914,6 +951,264 @@ fn node_addr_mode() {
     }
 }
 
+// ---- serve-tcp / dial-tcp / dial-raw ----------------------------------------------
+
+const TCP_MTU: u16 = 1400;
+
+/// The stream exchange shared by serve-tcp and dial-tcp (see the header).
+fn tcp_exchange(stream: &mut TcpStream, sess: &mut NoiseSession, lisp_idx: SessionIndex, our_idx: u32) {
+    let mut big = vec![0x12u8];
+    big.extend((0..600u32).map(|i| (i * 7 + 3) as u8));
+    let frames: [(u8, u32, Vec<u8>); 3] = [
+        (0, 1000, [&[0x10u8][..], b"frame zero"].concat()),
+        (FLAG_CE | FLAG_SP, 2000, [&[0x11u8][..], b"frame one"].concat()),
+        (FLAG_KEY_EPOCH, u32::MAX, big),
+    ];
+    let mut out = Vec::new();
+    for (i, (flags, ts, msg)) in frames.iter().enumerate() {
+        let wire = seal_frame(sess, lisp_idx, *flags, *ts, msg);
+        line(&format!("frame_{i}"), &wire);
+        text(&format!("frame_{i}_flags"), &flags.to_string());
+        text(&format!("frame_{i}_timestamp"), &ts.to_string());
+        line(&format!("frame_{i}_message"), msg);
+        out.extend_from_slice(&wire);
+    }
+    text("frames_ready", "1");
+    flush();
+    if let Err(e) = stream.write_all(&out) {
+        text("stream_end", &format!("write: {e}"));
+        text("frames_received", "0");
+        flush();
+        return;
+    }
+    let mut n = 0u32;
+    loop {
+        let data = match read_fmp_packet(stream, TCP_MTU) {
+            Ok(d) => d,
+            Err(e) => {
+                text("stream_end", &e.to_string());
+                text("frames_received", &n.to_string());
+                flush();
+                return;
+            }
+        };
+        let header = match EncryptedHeader::parse(&data) {
+            Some(h) => h,
+            None => {
+                text("error", "not an established frame");
+                text("frame_result", "error");
+                flush();
+                continue;
+            }
+        };
+        if header.receiver_idx.as_u32() != our_idx {
+            text("error", "frame for another receiver_idx");
+            text("frame_result", "error");
+            flush();
+            continue;
+        }
+        let ct = &data[header.ciphertext_offset()..];
+        match sess.decrypt_with_replay_check_and_aad(ct, header.counter, &header.header_bytes) {
+            Err(e) => {
+                text("error", &e.to_string());
+                text("frame_result", "error");
+            }
+            Ok(pt) => match strip_inner_header(&pt) {
+                None => {
+                    text("error", "inner header too short");
+                    text("frame_result", "error");
+                }
+                Some((ts, msg)) => {
+                    n += 1;
+                    text("frame_receiver_idx", &header.receiver_idx.as_u32().to_string());
+                    text("frame_counter", &header.counter.to_string());
+                    text("frame_flags", &header.flags.to_string());
+                    text("frame_timestamp", &ts.to_string());
+                    let ok = header.payload_len as usize == data.len() - ESTABLISHED_HEADER_SIZE - 16;
+                    text("frame_payload_len_ok", if ok { "1" } else { "0" });
+                    line("frame_message", msg);
+                    let msg = msg.to_vec();
+                    let echo = seal_frame(sess, lisp_idx, 0, ts.wrapping_add(1), &msg);
+                    text("frame_result", "ok");
+                    flush();
+                    if let Err(e) = stream.write_all(&echo) {
+                        text("echo_error", &e.to_string());
+                    }
+                }
+            },
+        }
+        flush();
+    }
+}
+
+fn read_text_line() -> String {
+    let mut l = String::new();
+    if std::io::stdin().lock().read_line(&mut l).unwrap_or(0) == 0 {
+        eprintln!("oracle: unexpected end of input");
+        std::process::exit(3);
+    }
+    l.trim().to_string()
+}
+
+fn serve_tcp(secp: &Secp256k1<secp256k1::All>) {
+    let resp_kp = keypair(secp);
+    let mut resp = HandshakeState::new_responder(resp_kp);
+    resp.set_local_epoch(epoch());
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+    line("responder_static", &PublicKey::from_keypair(&resp_kp).serialize());
+    text("port", &listener.local_addr().expect("local addr").port().to_string());
+    text("ready", "1");
+    flush();
+    let (mut stream, _) = listener.accept().expect("accept");
+    drop(listener);
+    stream.set_read_timeout(Some(Duration::from_secs(20))).ok();
+    let packet = match read_fmp_packet(&mut stream, TCP_MTU) {
+        Ok(p) => p,
+        Err(e) => {
+            text("result", "error");
+            text("error", &e.to_string());
+            flush();
+            return;
+        }
+    };
+    let header = match Msg1Header::parse(&packet) {
+        Some(h) => h,
+        None => {
+            text("result", "error");
+            text("error", "malformed msg1");
+            flush();
+            return;
+        }
+    };
+    if let Err(e) = resp.read_message_1(&packet[header.noise_msg1_offset..]) {
+        text("result", "error");
+        text("error", &e.to_string());
+        flush();
+        return;
+    }
+    let msg2 = resp.write_message_2().expect("write msg2");
+    let our_idx = random_u32();
+    let wire = build_msg2(SessionIndex::new(our_idx), header.sender_idx, &msg2);
+    text("result", "ok");
+    line("handshake_hash", &resp.handshake_hash());
+    line("initiator_static", &resp.remote_static().expect("learned rs").serialize());
+    line("remote_epoch", &resp.remote_epoch().expect("epoch after msg1"));
+    text("lisp_receiver_idx", &header.sender_idx.as_u32().to_string());
+    text("oracle_receiver_idx", &our_idx.to_string());
+    flush();
+    let mut sess = resp.into_session().expect("responder session");
+    stream.write_all(&wire).expect("write msg2");
+    tcp_exchange(&mut stream, &mut sess, header.sender_idx, our_idx);
+}
+
+fn dial_tcp(secp: &Secp256k1<secp256k1::All>) {
+    let port: u16 = read_text_line().parse().expect("port");
+    let resp_pub = PublicKey::from_slice(&read_hex_line()).unwrap_or_else(|e| {
+        eprintln!("oracle: invalid responder static key: {e}");
+        std::process::exit(3);
+    });
+    let init_kp = keypair(secp);
+    let mut init = HandshakeState::new_initiator(init_kp, resp_pub);
+    init.set_local_epoch(epoch());
+    let msg1 = init.write_message_1().expect("write msg1");
+    let our_idx = random_u32();
+    line("initiator_static", &PublicKey::from_keypair(&init_kp).serialize());
+    flush();
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(20))).ok();
+    stream.write_all(&build_msg1(SessionIndex::new(our_idx), &msg1)).expect("write msg1");
+    let packet = match read_fmp_packet(&mut stream, TCP_MTU) {
+        Ok(p) => p,
+        Err(e) => {
+            text("result", "error");
+            text("error", &e.to_string());
+            flush();
+            return;
+        }
+    };
+    let header = match Msg2Header::parse(&packet) {
+        Some(h) if h.receiver_idx.as_u32() == our_idx => h,
+        _ => {
+            text("result", "error");
+            text("error", "malformed msg2 or wrong receiver_idx");
+            flush();
+            return;
+        }
+    };
+    if let Err(e) = init.read_message_2(&packet[header.noise_msg2_offset..]) {
+        text("result", "error");
+        text("error", &e.to_string());
+        flush();
+        return;
+    }
+    text("result", "ok");
+    line("handshake_hash", &init.handshake_hash());
+    line("remote_epoch", &init.remote_epoch().expect("epoch after msg2"));
+    text("lisp_receiver_idx", &header.sender_idx.as_u32().to_string());
+    text("oracle_receiver_idx", &our_idx.to_string());
+    flush();
+    let mut sess = init.into_session().expect("initiator session");
+    tcp_exchange(&mut stream, &mut sess, header.sender_idx, our_idx);
+}
+
+fn dial_raw() {
+    let mut stream: Option<TcpStream> = None;
+    loop {
+        let mut l = String::new();
+        if std::io::stdin().lock().read_line(&mut l).unwrap_or(0) == 0 {
+            return;
+        }
+        let mut parts = l.trim().splitn(2, ' ');
+        let cmd = parts.next().unwrap_or("");
+        let arg = parts.next().unwrap_or("");
+        match cmd {
+            "end" => return,
+            "connect" => {
+                stream = Some(TcpStream::connect(("127.0.0.1", arg.parse::<u16>().expect("port")))
+                    .expect("connect"));
+            }
+            "send" => {
+                let s = stream.as_mut().expect("connected");
+                if let Err(e) = s.write_all(&hex::decode(arg).expect("hex")) {
+                    text("send_error", &e.to_string());
+                }
+            }
+            "sleep" => std::thread::sleep(Duration::from_millis(arg.parse().expect("ms"))),
+            "shutdown" => {
+                let _ = stream.as_ref().expect("connected").shutdown(std::net::Shutdown::Write);
+            }
+            "wait-close" => {
+                let s = stream.as_mut().expect("connected");
+                let limit = Duration::from_millis(arg.parse().expect("ms"));
+                let start = Instant::now();
+                let mut got = 0usize;
+                let mut buf = [0u8; 4096];
+                let kind = loop {
+                    let left = limit.saturating_sub(start.elapsed());
+                    if left.is_zero() {
+                        break "timeout";
+                    }
+                    s.set_read_timeout(Some(left)).ok();
+                    match s.read(&mut buf) {
+                        Ok(0) => break "eof",
+                        Ok(k) => got += k,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => break "timeout",
+                        Err(_) => break "reset",
+                    }
+                };
+                text("peer_closed", if kind == "timeout" { "0" } else { "1" });
+                text("close_kind", kind);
+                text("waited_ms", &start.elapsed().as_millis().to_string());
+                text("bytes_received", &got.to_string());
+            }
+            _ => text("error", "unknown command"),
+        }
+        text("ok", cmd);
+        flush();
+    }
+}
+
 fn main() {
     let secp = Secp256k1::new();
     match std::env::args().nth(1).as_deref() {
@@ -928,11 +1223,14 @@ fn main() {
         Some("verify-xk-responder-retry-plain") => verify_xk_responder_retry(&secp, true),
         Some("verify-rekey") => verify_rekey(&secp),
         Some("node-addr") => node_addr_mode(),
+        Some("serve-tcp") => serve_tcp(&secp),
+        Some("dial-tcp") => dial_tcp(&secp),
+        Some("dial-raw") => dial_raw(),
         _ => {
             eprintln!(
                 "usage: oracle ik|xk|verify-ik-initiator|verify-ik-responder|\
                  verify-xk-initiator|verify-xk-responder|verify-frame|node-addr|\
-                 verify-xk-responder-retry[-plain]|verify-rekey"
+                 verify-xk-responder-retry[-plain]|verify-rekey|serve-tcp|dial-tcp|dial-raw"
             );
             std::process::exit(2);
         }

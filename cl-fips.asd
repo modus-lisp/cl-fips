@@ -20,7 +20,8 @@
                              (:file "fips-noise")
                              (:file "fmp")
                              (:file "identity")
-                             (:file "rekey"))))
+                             (:file "rekey")
+                             (:file "link"))))
   :in-order-to ((test-op (test-op "cl-fips/test"))))
 
 (defsystem "cl-fips/test"
@@ -30,5 +31,18 @@
   :components ((:module "test" :serial t
                 :components ((:file "test") (:file "noise-test") (:file "frame-test")
                              (:file "try-read-test")
-                             (:file "rekey-test"))))
+                             (:file "rekey-test")
+                             (:file "link-test"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-fips.test '#:run-all)))
+
+;;; The socket adapter.  Development-only: usocket on SBCL.  Nothing in src/
+;;; depends on it; it only supplies the two closures of a BYTE-PORT.
+(defsystem "cl-fips/transport"
+  :description "TCP adapter for cl-fips stream links (usocket; SBCL development use)."
+  :depends-on ("cl-fips" "usocket")
+  :components ((:module "transport" :components ((:file "tcp")))))
+
+(defsystem "cl-fips/transport-test"
+  :description "FMP over real TCP against the upstream Rust oracle."
+  :depends-on ("cl-fips/test" "cl-fips/transport")
+  :components ((:module "test" :components ((:file "tcp-test")))))

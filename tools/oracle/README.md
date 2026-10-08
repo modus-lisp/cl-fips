@@ -18,3 +18,8 @@ it byte-for-byte.
   the genuine one) and `verify-rekey` (one side of an FMP link rekey; its rekey
   driver transliterates upstream's `peer/active.rs` and
   `node/dataplane/encrypted.rs`, which are not vendored).
+- TCP modes `serve-tcp`, `dial-tcp` (IK + FMP frames over real loopback TCP)
+  and `dial-raw` (a raw peer for malformed input) read packets with
+  `src/framing.rs`: upstream `src/transport/framing.rs`, constants and
+  `StreamError` verbatim, `read_fmp_packet` transliterated from tokio to
+  blocking `std::io::Read`.

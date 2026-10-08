@@ -68,6 +68,9 @@
     (multiple-value-bind (fl len ctr) (decode-fsp-header h)
       (check "fsp round trip" (and (= fl 1) (= len 40) (= ctr 7))))))
 
+(defvar *tcp-suite* nil
+  "Set by tcp-test.lisp when cl-fips/transport-test is loaded (it needs usocket).")
+
 (defun run-all ()
   (setf *failures* 0 *checks* 0)
   (test-little-endian)
@@ -85,5 +88,9 @@
   (test-identity)                       ; frame-test.lisp
   (test-try-read)                       ; try-read-test.lisp
   (test-rekey)                          ; rekey-test.lisp
+  (test-link-local)                     ; link-test.lisp
+  (if *tcp-suite*
+      (funcall *tcp-suite*)             ; tcp-test.lisp
+      (format t "  SKIPPED: TCP arms (cl-fips/transport-test not loaded; it needs usocket)~%"))
   (format t "~&~d checks, ~d failures~%" *checks* *failures*)
   (zerop *failures*))
