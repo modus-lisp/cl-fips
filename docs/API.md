@@ -43,7 +43,7 @@ list is at the top of `src/node.lisp`). Nothing reads a clock or a socket.
 | `(node-open-session node peer-key &key peer-coords via now)` | Open an end-to-end session; `(values session :sent|:queued)`. |
 | `(node-send-data node peer-addr data &key src-port dst-port now)` | Send on an established session. |
 | `(node-lookup node peer-key &key now)` | Find a node's coordinates; answered by `(:lookup-ok addr coords path-mtu)` or `(:lookup-failed addr)`. |
-| `(node-start-rekey node peer-addr &key now)` | Rekey a session now (the node also rekeys on its own schedule). |
+| `(node-start-rekey node peer-addr &key now)` | Rekey a session now. The node also rekeys every session on upstream's schedule (120 s ± 15 s, or 65,536 frames) unless `(setf (cl-fips::fips-node-auto-rekey node) nil)`. |
 | `(node-session node addr)`, `(node-route node addr)`, `(node-cached-coords node addr)`, `(node-our-coords node)`, `(node-peer-coords node addr)`, `(node-tree-peer-p node addr)` | Queries. |
 | `node-error`, `node-error-reason` | The condition the node signals. |
 

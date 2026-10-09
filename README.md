@@ -211,9 +211,9 @@ these come from):
 - **Link msg1 retransmission on TCP.** On UDP, msg1 is resent at 1, 3, 7 and 15 s.
   TCP is reliable: an unanswered dial is abandoned after 30 s and redialled.
   Our SessionSetup is resent every 4 s, up to 10 times.
-- **Cross-connection tie-break.** If two daemons dial each other at the same
-  moment over UDP, each drops the other's msg1. Both dials time out, and the
-  jittered redial separates them.
+- **Session-level MMP** (FSP SenderReport / ReceiverReport, PathMtuNotification).
+  We read them and ignore them, and we send none. After a rekey with no data to
+  send, we send a CoordsWarmup so the peer sees the new session.
 - **Reading the peers' filters** for routing decisions, and parent hysteresis,
   flap dampening and cost-based parent choice.
 - **Path-MTU exchange and fragmentation.** A DataPacket larger than about 1290 bytes
@@ -234,7 +234,9 @@ For SBCL on Linux:
 - [x] Coordinate lookup, checked against real nodes in both directions
 - [x] A runnable node: config, persistent identity, listeners, redial
 - [ ] Repeated real-node runs with recorded pass rates
-- [ ] A second independent review (FSP, MMP, the transports, lookup, the daemon)
+- [x] A second independent review (FSP, MMP, the transports, lookup, the daemon).
+      Its eleven findings are fixed, each with a regression test
+      (`test/review-test.lisp`, `test/daemon-test.lisp` D6-D9)
 - [ ] Merge the `fips-noise` branches of natrium and secp256k1-fast, document
       the API, and tag
 
