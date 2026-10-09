@@ -116,8 +116,29 @@ test mesh (`test-us01.fips.network`) and fetches
 `http://npub1crpldvy49ef8z34wlacwujnfudy4nd7k96aqdx5wgn6ckztz7z8q9t59ud.fips/`:
 HTTP 200, 141 KB in about 770 ms, with no TUN, no root and no Rust on our side.
 
-Not yet: tests of either stream path under loss (both resend, but only loopback
-and the live mesh have exercised them), and IPv6 for anything but TCP.
+### Under a bad network
+
+`scripts/run-conditioned.sh` puts `scripts/netem-proxy.py`, a seeded UDP
+impairment proxy, between the nodes. The proxy adds loss, delay, jitter (which
+reorders) and duplication, in each direction. Results on this machine, with a
+1 MiB random file checked by SHA-256 over the stream, and probes echoed by the
+real upstream node:
+
+| profile | stream (1 MiB, byte-exact) | echo probes back (datagrams, no resend) |
+|---|---|---|
+| clean | 3.8 s | 20 of 20 |
+| lossy: 5% loss, 40 ± 20 ms | 5.4 s | 17 of 19 |
+| bad: 15% loss, 80 ± 60 ms, 2% duplicated | 11 s | 11 of 19 |
+| awful: 30% loss, 150 ± 100 ms, 5% duplicated | 69 s | 7 of 19 |
+
+In every profile, no echo came back altered, and the link never dropped. With
+`MESH=1`, the proxy sits in front of `test-us01` on the public mesh, and
+`cl-transport/tcp` reads its SSH banner over the IPv6 shim: PASS under clean,
+lossy and bad. Two defects were found this way and fixed: the stream's
+cumulative-only acks (selective acks now), and a TCP engine that never re-acked
+a repeated SYN-ACK.
+
+Not yet: IPv6 for anything but TCP.
 
 ## Layout
 

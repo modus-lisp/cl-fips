@@ -15,8 +15,9 @@
 (defvar *url* (or (second sb-ext:*posix-argv*) "http://npub1crpldvy49ef8z34wlacwujnfudy4nd7k96aqdx5wgn6ckztz7z8q9t59ud.fips/"))
 (let* ((ep (cl-fips.stream:start-fips-client
             (list :udp '(:bind "0.0.0.0:0")
-                  :peers '((:npub "npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98"
-                            :transport :udp :addr "test-us01.fips.network:2121" :alias "test-us01")))
+                  :peers `((:npub "npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98"
+                            :transport :udp :addr ,(or (sb-ext:posix-getenv "MESH_PEER_ADDR") "test-us01.fips.network:2121")
+                            :alias "test-us01")))
             :log (and (third sb-ext:*posix-argv*) *standard-output*)))
        (d (cl-fips.stream:endpoint-daemon ep)))
   (loop repeat 300 until (cl-fips:fips-node-links (cl-fips.daemon:daemon-node d)) do (sleep 0.1))
@@ -28,5 +29,6 @@
     (when r
       (format t "HTTP ~d, ~d bytes in ~d ms~%" (seal.http:response-status r) (length (seal.http:response-body r))
               (round (* 1000 (- (get-internal-real-time) t0)) internal-time-units-per-second))
-      (format t "~a~%" (let ((b (map 'string #'code-char (seal.http:response-body r)))) (subseq b 0 (min 1500 (length b))))))
+      (let ((o (coerce (seal.http:response-body r) '(simple-array (unsigned-byte 8) (*)))))
+        (format t "LEN ~d SHA256 ~(~{~2,'0x~}~)~%" (length o) (coerce (natrium:sha256 o) 'list))))
     (cl-fips.stream:stop-fips-endpoint ep)))

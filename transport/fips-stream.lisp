@@ -13,11 +13,15 @@
 ;;;;   SYN-OK  the gateway connected            SYN-FAIL  it did not (payload: why)
 ;;;;   DATA    one segment, numbered by seq     FIN       end of stream (takes a seq)
 ;;;;   ACK     ack = the next seq expected      RST       abort
+;;;;           payload: a u64 LE bitmap, bit i = seq ack+1+i has arrived (selective ack)
 ;;;;
 ;;;; Segments are at most +SEGMENT+ bytes, so one DataPacket fits a UDP link (1280 -
-;;;; 110 bytes of FIPS framing).  At most +WINDOW+ unacknowledged segments; each is
-;;;; resent after 1 s, doubling, and the stream fails after +MAX-TRIES+ sends.  Acks
-;;;; are cumulative; out-of-order segments wait for the gap.
+;;;; 110 bytes of FIPS framing).  At most +WINDOW+ segments past the cumulative ack are
+;;;; in flight.  Acks are cumulative plus a selective bitmap, so a lost segment is
+;;;; resent alone: at once when three later ones are known to have arrived (at most
+;;;; once a round trip), otherwise when its own timer runs out (RFC 6298's estimator,
+;;;; doubling, capped); the stream fails after +MAX-TRIES+ sends of one segment.
+;;;; Out-of-order segments wait for the gap.
 ;;;;
 ;;;; Threads: one thread runs the daemon and every protocol timer, and is the only
 ;;;; one that touches the daemon.  A caller's thread only queues bytes and waits on a
@@ -37,9 +41,14 @@
 
 (defconstant +stream-port+ 7100 "The service port streams use, on both ends.")
 (defconstant +segment+ 1100)
-(defconstant +window+ 32)
-(defconstant +rto-ms+ 1000)
-(defconstant +max-tries+ 8)
+(defconstant +window+ 64 "Segments in flight, as a range of sequence numbers past the
+   cumulative ack -- the width of the selective-ack bitmap.")
+(defconstant +rto-ms+ 1000 "The first RTO, before any round trip has been measured.")
+(defconstant +rto-min-ms+ 200)
+(defconstant +rto-max-ms+ 4000 "The measured RTO's ceiling.")
+(defconstant +backoff-max-ms+ 8000 "A segment's resend interval never backs off past this.")
+(defconstant +max-tries+ 20 "Sends of one segment before the stream fails (minutes at the cap).")
+
 (defconstant +header+ 13)
 (defconstant +syn+ 1) (defconstant +syn-ok+ 2) (defconstant +syn-fail+ 3)
 (defconstant +data+ 4) (defconstant +ack+ 5) (defconstant +fin+ 6) (defconstant +rst+ 7)
@@ -70,6 +79,8 @@
   (syn nil) (syn-at 0) (syn-tries 0)
   ;; receiving
   (expect 0) (ooo (make-hash-table)) (inbox '()) (eof nil) (ack-due nil)
+  ;; RFC 6298's estimator, and fast retransmit
+  (srtt nil) (rttvar 0) (rto +rto-ms+) (last-ack 0)
   ;; the gateway's side: the TCP socket it bridges to
   socket (tcp-eof nil)
   ;; a stream to a FIPS node's own TCP, through the IPv6 shim: our TCP engine
@@ -158,13 +169,14 @@
     (loop while (conn-ctrl c) do (%send c (pop (conn-ctrl c))))
     ;; the SYN, until it is answered
     (when (and (conn-syn c) (eq (conn-state c) :connecting)
-               (>= (- now (conn-syn-at c)) (* +rto-ms+ (ash 1 (max 0 (1- (conn-syn-tries c)))))))
+               (>= (- now (conn-syn-at c))
+                   (min +backoff-max-ms+ (* +rto-ms+ (ash 1 (max 0 (1- (conn-syn-tries c))))))))
       (if (>= (conn-syn-tries c) +max-tries+)
           (%fail c "the gateway did not answer")
           (progn (%send c (conn-syn c)) (setf (conn-syn-at c) now) (incf (conn-syn-tries c)))))
     (when (eq (conn-state c) :open)
       ;; new segments, while the window allows
-      (loop while (and (< (hash-table-count (conn-unacked c)) +window+)
+      (loop while (and (< (- (conn-next-seq c) (conn-last-ack c)) +window+)
                        (or (conn-outq c) (and (conn-fin-queued c) (not (conn-fin-sent c)))))
             do (if (conn-outq c)
                    (let* ((all (apply #'concatenate '(vector (unsigned-byte 8)) (conn-outq c)))
@@ -185,16 +197,45 @@
       ;; retransmissions
       (maphash (lambda (seq entry)
                  (destructuring-bind ((type . payload) sent tries) entry
-                   (when (>= (- now sent) (* +rto-ms+ (ash 1 (1- tries))))
+                   (when (>= (- now sent) (min +backoff-max-ms+ (* (conn-rto c) (ash 1 (1- tries)))))
                      (if (>= tries +max-tries+)
                          (%fail c "the peer stopped acknowledging")
                          (progn (setf (gethash seq (conn-unacked c)) (list (cons type payload) now (1+ tries)))
                                 (%send c (encode type (conn-id c) seq (conn-expect c) payload)))))))
                (conn-unacked c)))
-    ;; a bare ack when nothing carried one
+    ;; a bare ack when nothing carried one, with the selective bitmap
     (when (conn-ack-due c)
-      (%send c (encode +ack+ (conn-id c) 0 (conn-expect c)))
+      (%send c (encode +ack+ (conn-id c) 0 (conn-expect c) (%sack-bitmap c)))
       (setf (conn-ack-due c) nil))))
+
+(defun %sack-bitmap (c)
+  "Bit i: segment expect+1+i is held, waiting for the gap.  8 bytes, LE."
+  (let ((bits 0) (base (1+ (conn-expect c))))
+    (maphash (lambda (seq v) (declare (ignore v))
+               (let ((i (- seq base))) (when (< -1 i 64) (setf bits (logior bits (ash 1 i))))))
+             (conn-ooo c))
+    (cl-fips:encode-u64le bits)))
+
+(defun %apply-sack (c ack bitmap now)
+  "The peer holds the segments BITMAP names: stop resending them, and resend a hole
+   at once when three later segments have arrived and it was not sent within the
+   last round trip."
+  (let ((bits (cl-fips:decode-u64le bitmap 0)) (highest nil))
+    (dotimes (i 64)
+      (when (logbitp i bits)
+        (let ((seq (+ ack 1 i)))
+          (remhash seq (conn-unacked c))
+          (setf highest seq))))
+    (when highest
+      (loop for seq from ack below highest
+            do (let ((hole (gethash seq (conn-unacked c))))
+                 (when (and hole
+                            (>= (logcount (ldb (byte 64 0) (ash bits (- (- seq ack))))) 3)
+                            (>= (- now (second hole)) (max +rto-min-ms+ (round (or (conn-srtt c) +rto-ms+)))))
+                   (destructuring-bind ((type . payload) sent tries) hole
+                     (declare (ignore sent))
+                     (setf (gethash seq (conn-unacked c)) (list (cons type payload) now tries))
+                     (%send c (encode type (conn-id c) seq (conn-expect c) payload)))))))))
 
 ;;; --- the daemon thread: receiving -----------------------------------------------------
 
@@ -231,9 +272,21 @@
       ((= type +rst+) (%fail c "reset by the peer"))
       (t
        ;; every DATA / FIN / ACK carries a cumulative ack
-       (let ((done '()))
-         (maphash (lambda (s e) (declare (ignore e)) (when (< s ack) (push s done))) (conn-unacked c))
-         (dolist (s done) (remhash s (conn-unacked c))))
+       (let ((done '()) (sample nil) (now (now-ms ep)))
+         (maphash (lambda (s e)
+                    (when (< s ack)
+                      (push s done)
+                      ;; Karn: only a segment sent once measures the round trip
+                      (destructuring-bind (frame sent tries) e
+                        (declare (ignore frame))
+                        (when (= tries 1) (setf sample (max (or sample 0) (- now sent)))))))
+                  (conn-unacked c))
+         (dolist (s done) (remhash s (conn-unacked c)))
+         (when sample (%rtt-sample c sample))
+         (when (> ack (conn-last-ack c)) (setf (conn-last-ack c) ack))
+         ;; selective acks: what arrived past the gap, and the holes worth resending now
+         (when (and (= type +ack+) (>= (length payload) 8))
+           (%apply-sack c ack (subseq payload 0 8) now)))
        (when (member type (list +data+ +fin+))
          (setf (conn-ack-due c) t)
          (when (>= seq (conn-expect c))
@@ -245,6 +298,14 @@
                   (if (= (car next) +fin+) (%peer-fin c) (%deliver c (cdr next)))))
        (%maybe-done c)
        (%wake c)))))
+
+(defun %rtt-sample (c r)
+  "RFC 6298 section 2: fold a round-trip sample R (ms) into SRTT and RTTVAR."
+  (if (null (conn-srtt c))
+      (setf (conn-srtt c) r (conn-rttvar c) (/ r 2))
+      (setf (conn-rttvar c) (+ (* 3/4 (conn-rttvar c)) (* 1/4 (abs (- (conn-srtt c) r))))
+            (conn-srtt c) (+ (* 7/8 (conn-srtt c)) (* 1/8 r))))
+  (setf (conn-rto c) (round (max +rto-min-ms+ (min +rto-max-ms+ (+ (conn-srtt c) (* 4 (conn-rttvar c))))))))
 
 (defun %maybe-done (c)
   "Both directions finished and everything acknowledged: the stream is closed."
