@@ -321,7 +321,9 @@ For SBCL on Linux:
 - [x] UDP transport, with handshake resends and dead-link detection
 - [x] Coordinate lookup, checked against real nodes in both directions
 - [x] A runnable node: config, persistent identity, listeners, redial
-- [ ] Repeated real-node runs with recorded pass rates
+- [x] Repeated real-node runs with recorded pass rates: 45 of 45 (UDP, lookup,
+      multi-hop and transit 10 each; TCP with rekeys over 150 s, 5), plus the
+      impaired-network profiles above
 - [x] A second independent review (FSP, MMP, the transports, lookup, the daemon).
       Its eleven findings are fixed, each with a regression test
       (`test/review-test.lisp`, `test/daemon-test.lisp` D6-D9)
