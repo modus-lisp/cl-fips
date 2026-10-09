@@ -27,7 +27,8 @@
                              (:file "tree")
                              (:file "fsp")
                              (:file "route")
-                             (:file "link"))))
+                             (:file "link")
+                             (:file "node"))))
   :in-order-to ((test-op (test-op "cl-fips/test"))))
 
 (defsystem "cl-fips/test"
@@ -42,6 +43,7 @@
                              (:file "routing-test")
                              (:file "fsp-test")
                              (:file "transit-test")
+                             (:file "node-test")
                              (:file "link-test"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-fips.test '#:run-all)))
 

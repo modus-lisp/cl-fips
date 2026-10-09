@@ -155,177 +155,111 @@
          (held (and tree (gethash node-addr (cl-fips::tree-state-peers tree)))))
     (and held (mapcar #'cl-fips:coord-entry-node (cdr held)))))
 
-(defun exchange (link sock secs static node-pub)
-  "Heartbeat every 5 s; poll the link (rekey decisions, MMP reports) every
-   200 ms; log each frame by msg_type and each rekey event.  Returns the
-   msg_types seen."
-  (let* ((t0 (ms)) (deadline (+ t0 (* 1000 secs))) (next-hb 0) (seen '())
-         (last-frame-log 0)
-         (fsp nil) (next-data 0) (data-count 0) (last-probe nil)
-         (rekey-at (rekey-at-seconds)) (rekey-started nil)
+(defun log-event (ev t0 state)
+  "Log one node event in the lines the runner scripts read.  STATE is a plist
+   cell (:last-probe ...)."
+  (let ((at (- (ms) t0)))
+    (case (first ev)
+      (:frame
+       (destructuring-bind (type link slot) (rest ev)
+         (declare (ignore link))
+         (bump :frames)
+         (when (eq slot :adopted)
+           (bump :adopted)
+           (setf (getf *stats* :frames-since-rotate) 0)
+           (out "~6d REKEY adopted: keys rotated" at))
+         (when (getf *stats* :frames-since-rotate) (bump :frames-since-rotate))
+         (unless (member type '(1 2 0))
+           (out "~6d RECV msg_type=0x~2,'0x slot=~(~a~)" at type slot))))
+      (:link-event (bump (second ev)) (out "~6d REKEY ~(~a~) (rekey packet from the node)" at (second ev)))
+      (:link-action
+       (bump (second ev))
+       (when (eq (second ev) :cutover) (setf (getf *stats* :frames-since-rotate) 0))
+       (out "~6d REKEY ~(~a~)" at (second ev)))
+      (:link-drop (out "~6d LINK-ERROR ~(~a~) (frame dropped, link kept)" at (second ev)))
+      (:link-closed (out "~6d LINK-ERROR ~(~a~) (link closed)" at (second ev)))
+      (:established (out "~6d FSP SessionAck received; SessionMsg3 sent; session established" at))
+      (:accepted (out "~6d FSP session opened by ~a accepted" at (hex (second ev))))
+      (:accept-answered (out "~6d FSP SessionSetup from ~a answered" at (hex (second ev))))
+      (:setup-resent (out "~6d FSP SessionSetup resent (no SessionAck yet)" at))
+      (:rekey-answered (out "~6d FSP rekey: SessionSetup answered with SessionAck" at))
+      (:rekey-msg3 (out "~6d FSP rekey: SessionMsg3 taken; the new session waits for its first frame" at))
+      (:rekey-ack (out "~6d FSP rekey: SessionAck handled; SessionMsg3 sent" at))
+      (:cutover (out "~6d FSP rekey cutover: the node's new session is current" at))
+      (:data
+       (destructuring-bind (peer sp dp data ts) (rest ev)
+         (declare (ignore peer ts))
+         (cond
+           ((/= sp 4600)
+            (out "~6d FSP DataPacket from the node src_port=~d dst_port=~d data=~s"
+                 at sp dp (map 'string #'code-char data)))
+           ((and (getf (car state) :last-probe) (equalp data (getf (car state) :last-probe)))
+            (out "~6d FSP echo OK: the node returned our ~d bytes from port 4600" at (length data)))
+           (t (out "~6d FSP echo MISMATCH from port 4600 (~d bytes)" at (length data))))))
+      (:session-frame nil)
+      (:session-error (out "~6d FSP: ~a" at (third ev)))
+      (:unsolicited (out "~6d FSP: datagram from ~a with no session (phase ~a)" at (hex (second ev)) (third ev)))
+      (:forwarded nil)
+      (:dropped (out "~6d dropped ~(~a~)" at (second ev)))
+      (t (out "~6d ~s" at ev)))))
+
+(defun exchange (node link sock secs node-pub)
+  "Run NODE on LINK for SECS: the node's tick (heartbeats, link rekey, MMP,
+   announces), its session with the FSP peer (open, probe every 5 s, our rekey at
+   CL_FIPS_FSP_REKEY_AT), and everything it receives.  Returns the msg_types seen."
+  (let* ((t0 (ms)) (deadline (+ t0 (* 1000 secs))) (seen '())
+         (state (list (list :last-probe nil)))
+         (next-data 0) (data-count 0)
+         (rekey-at (rekey-at-seconds)) (rekey-started nil) (opened nil)
          ;; the FSP peer: the node we are linked to, or -- with CL_FIPS_FSP_PEER_DIR
          ;; set -- a node behind it that the session reaches through that link
          (fsp-pub (or (fsp-target-pub) node-pub))
          (fsp-addr (cl-fips:node-addr fsp-pub))
-         (multihop (and (fsp-target-pub) t))
-         (our-addr (cl-fips:node-addr (secp256k1-fast.ecdh:keypair-public-bytes static))))
-    (loop while (< (ms) deadline) do
-      (when (>= (ms) next-hb)
-        (cl-fips:stream-link-send link (coerce #(#x51) '(vector (unsigned-byte 8))))
-        (out "~6d SENT msg_type=0x51 (Heartbeat) k=~:[0~;1~]"
-             (- (ms) t0) (cl-fips:stream-link-k-bit link))
-        (setf next-hb (+ (ms) 5000)))
-      ;; the end-to-end session: start once the node's ancestry is known
-      (when (and (fsp-enabled-p) (null fsp))
-        (let ((peer-coords (or (fsp-peer-coords link fsp-addr)
-                               (and multihop (list fsp-addr))))
-              (tree (cl-fips:stream-link-tree link)))
-          (when (and peer-coords tree (cl-fips:tree-state-entries tree))
-            (setf fsp (cl-fips:make-fsp-initiator
-                       static fsp-pub (natrium:random-bytes 8) our-addr fsp-addr
-                       (mapcar #'cl-fips:coord-entry-node (cl-fips:tree-state-entries tree))
-                       peer-coords))
-            (let ((d (cl-fips:fsp-setup-datagram fsp (ms))))
-              (cl-fips:stream-link-send link d)
-              (out "~6d FSP SessionSetup sent to the node (XK msg1)" (- (ms) t0))))))
-      ;; an unanswered SessionSetup is sent again (the relay may not know the way yet)
-      (when fsp
-        (let ((again (cl-fips:fsp-resend-setup fsp (ms))))
-          (when again
-            (cl-fips:stream-link-send link again)
-            (out "~6d FSP SessionSetup resent (no SessionAck yet)" (- (ms) t0)))))
-      ;; we start the FSP rekey once, after REKEY-AT seconds
-      (when (and fsp rekey-at (not rekey-started)
-                 (eq (cl-fips:fsp-initiator-phase fsp) :established)
-                 (>= (- (ms) t0) (* 1000 rekey-at)))
-        (setf rekey-started t)
-        (cl-fips:stream-link-send link (cl-fips:fsp-start-rekey fsp :now (ms)))
-        (out "~6d FSP rekey: SessionSetup sent (ours)" (- (ms) t0)))
-      (when (and fsp (eq (cl-fips:fsp-initiator-phase fsp) :established) (>= (ms) next-data))
-        (incf data-count)
-        ;; CL_FIPS_ECHO=on (default): the probe goes to port 4600, which the node's
-        ;; native-echo holds, so the node sends the bytes back; otherwise the IPv6
-        ;; shim (256) decrypts and rejects them.
-        (let* ((payload (probe-payload data-count))
-               (port (if (echo-enabled-p) 4600 256))
-               ;; building the datagram is what cuts over a rekey we started
-               (cutting (cl-fips::fsp-initiator-rekey-initiator-p fsp))
-               (d (cl-fips:fsp-data-datagram fsp payload :dst-port port
-                                                         :timestamp-ms (ldb (byte 32 0) (- (ms) t0))
-                                                         :now (ms))))
-          ;; a DataPacket is 110 bytes of framing around its data on the link (FMP
-          ;; header and tag, the SessionDatagram header, the FSP header and tag, the
-          ;; inner and port headers); anything above that does not fit the link MTU
-          (let ((limit (- (cl-fips::stream-link-mtu link) 110)))
-            (cond
-              ((> (length payload) limit)
-               (out "~6d FSP probe ~d NOT SENT: ~d bytes exceeds the ~d-byte limit (link MTU ~d less 110)"
-                    (- (ms) t0) data-count (length payload) limit (cl-fips::stream-link-mtu link)))
-              (t
-               (setf last-probe payload)
-               (cl-fips:stream-link-send link d)
-               (when (and cutting (not (cl-fips::fsp-initiator-rekey-initiator-p fsp)))
-                 (out "~6d FSP rekey cutover (ours): the new session is current, K set" (- (ms) t0)))
-               (out "~6d FSP DataPacket ~d sent (dst_port ~d)" (- (ms) t0) data-count port)))))
-        (setf next-data (+ (ms) 5000)))
-      (multiple-value-bind (actions reports) (cl-fips:stream-link-poll link)
-        (dolist (a actions)
-          (bump a)
-          (when (eq a :cutover) (setf (getf *stats* :frames-since-rotate) 0))
-          (out "~6d REKEY ~(~a~) our_index=~8,'0x their_index=~8,'0x k=~:[0~;1~]"
-               (- (ms) t0) a (cl-fips:stream-link-our-index link)
-               (cl-fips:stream-link-their-index link) (cl-fips:stream-link-k-bit link)))
-        (dolist (r reports)
-          (bump (if (= r 2) :rr-sent :sr-sent))))
-      (when (or (listen (usocket:socket-stream sock))
-                (usocket:wait-for-input sock :timeout 0.2 :ready-only t))
-        (handler-case
-            (multiple-value-bind (m ts flags counter slot)
-                (cl-fips:stream-link-receive link :timeout-ms 10000)
-              (cond
-                ((null m)
-                 (bump ts)                 ; the event keyword
-                 (out "~6d REKEY ~(~a~) (rekey packet from the node) our_index=~8,'0x"
-                      (- (ms) t0) ts (cl-fips:stream-link-our-index link)))
-                ((and (= (aref m 0) 0) fsp)
-                 ;; a SessionDatagram: the SessionAck during setup, then established
-                 ;; FSP frames from the node (its session reports, and any data)
-                 (pushnew (aref m 0) seen)
-                 (handler-case
-                     (let ((payload (nth-value 4 (cl-fips:decode-session-datagram (subseq m 1)))))
-                       (cond
-                         ((and (= (cl-fips:prefix-phase payload) 2) (cl-fips::fsp-initiator-rekey-hs fsp))
-                          (let ((reply (cl-fips:fsp-handle-rekey-ack fsp (subseq m 1))))
-                            (cl-fips:stream-link-send link reply)
-                            (out "~6d FSP rekey: SessionAck handled; SessionMsg3 sent" (- (ms) t0))))
-                         ((eq (cl-fips:fsp-initiator-phase fsp) :setup-sent)
-                          (let ((reply (cl-fips:fsp-handle-ack fsp (subseq m 1))))
-                            (cl-fips:stream-link-send link reply)
-                            (out "~6d FSP SessionAck received; SessionMsg3 sent; session established"
-                                 (- (ms) t0))))
-                         ((= (cl-fips:prefix-phase payload) 1)
-                          ;; the node rekeys the FSP session: answer its msg1 with SessionAck
-                          (let ((reply (cl-fips:fsp-handle-rekey-setup fsp (subseq m 1) :now (ms))))
-                            (cl-fips:stream-link-send link reply)
-                            (out "~6d FSP rekey: SessionSetup answered with SessionAck" (- (ms) t0))))
-                         ((= (cl-fips:prefix-phase payload) 3)
-                          (cl-fips:fsp-handle-rekey-msg3 fsp (subseq m 1) :now (ms))
-                          (out "~6d FSP rekey: SessionMsg3 taken; the new session waits for its first frame"
-                               (- (ms) t0)))
-                         ((zerop (cl-fips:prefix-phase payload))
-                          (multiple-value-bind (mt sp dp data)
-                              (handler-case
-                                  (let ((had-pending (cl-fips::fsp-initiator-pending-session fsp)))
-                                    (multiple-value-prog1 (cl-fips:fsp-open-any fsp payload :now (ms))
-                                      (when (and had-pending (null (cl-fips::fsp-initiator-pending-session fsp)))
-                                        (out "~6d FSP rekey cutover: the node's new session is current"
-                                             (- (ms) t0)))))
-                                (error (e)
-                                  (multiple-value-bind (fl plen ctr) (cl-fips:decode-fsp-header payload)
-                                    (out "~6d FSP frame did not open: flags=~d payload_len=~d counter=~d (~a)"
-                                         (- (ms) t0) fl plen ctr e))
-                                  (values nil nil nil nil)))
-                            (declare (ignore dp))
-                            (cond
-                              ((null mt) nil)           ; logged above: the frame did not open
-                              ((and (= mt #x10) (/= sp 4600))
-                               ;; a DataPacket the node initiated (its native flow to us)
-                               (out "~6d FSP DataPacket from the node src_port=~d dst_port=~d data=~s"
-                                    (- (ms) t0) sp dp (map 'string #'code-char data)))
-                              ((and (= mt #x10) (= sp 4600))
-                               (if (and last-probe (equalp data last-probe))
-                                   (out "~6d FSP echo OK: the node returned our ~d bytes from port 4600"
-                                        (- (ms) t0) (length data))
-                                   (out "~6d FSP echo MISMATCH from port 4600 (~d bytes)"
-                                        (- (ms) t0) (length data))))
-                              (t
-                               (out "~6d FSP inbound established frame msg_type=0x~2,'0x len=~d"
-                                    (- (ms) t0) mt (length payload))))))
-                         (t (out "~6d FSP phase ~d ignored" (- (ms) t0)
-                                 (cl-fips:prefix-phase payload)))))
-                   (error (e) (out "~6d FSP: ~a" (- (ms) t0) e))))
-                (t
-                 (pushnew (aref m 0) seen)
-                 (bump :frames)
-                 (when (eq slot :adopted)
-                   (bump :adopted)
-                   (setf (getf *stats* :frames-since-rotate) 0)
-                   (out "~6d REKEY adopted: keys rotated our_index=~8,'0x their_index=~8,'0x k=~:[0~;1~]"
-                        (- (ms) t0) (cl-fips:stream-link-our-index link)
-                        (cl-fips:stream-link-their-index link) (cl-fips:stream-link-k-bit link)))
-                 (when (getf *stats* :frames-since-rotate) (bump :frames-since-rotate))
-                 ;; reports arrive every second: log one line per 10 s of them
-                 (when (or (not (member (aref m 0) '(1 2)))
-                           (>= (- (ms) last-frame-log) 10000))
-                   (when (member (aref m 0) '(1 2)) (setf last-frame-log (ms)))
-                   (out "~6d RECV msg_type=0x~2,'0x len=~d ts=~d flags=~d counter=~d slot=~(~a~)"
-                        (- (ms) t0) (aref m 0) (length m) ts flags counter slot)))))
-          (cl-fips:link-error (e)
-            (out "~6d LINK-ERROR ~a" (- (ms) t0) e)
-            (when (cl-fips:link-error-fatal-p e) (return))))))
+         (multihop (and (fsp-target-pub) t)))
+    (flet ((session () (cl-fips:node-session node fsp-addr))
+           (established-p (fi) (and fi (eq (cl-fips:fsp-initiator-phase fi) :established))))
+      (loop while (< (ms) deadline) do
+        (let ((now (ms)))
+          (dolist (ev (cl-fips:node-tick node now)) (log-event ev t0 state))
+          ;; the session: open once our and the peer's coordinates are known
+          (when (and (fsp-enabled-p) (not opened)
+                     (cl-fips:tree-state-entries (cl-fips:fips-node-tree node))
+                     (if multihop
+                         (cl-fips:node-route node fsp-addr)   ; the relay's filter reaches B
+                         (cl-fips:node-peer-coords node fsp-addr)))
+            (setf opened t)
+            (cl-fips:node-open-session node fsp-pub :now now
+                                                    :peer-coords (and multihop (list fsp-addr)))
+            (out "~6d FSP SessionSetup sent to the node (XK msg1)" (- now t0)))
+          ;; our FSP rekey, once, after REKEY-AT seconds
+          (when (and rekey-at (not rekey-started) (established-p (session))
+                     (>= (- now t0) (* 1000 rekey-at)))
+            (setf rekey-started t)
+            (cl-fips:node-start-rekey node fsp-addr :now now)
+            (out "~6d FSP rekey: SessionSetup sent (ours)" (- now t0)))
+          ;; a probe every 5 s: to the node's native-echo (4600) or the IPv6 shim (256)
+          (when (and (established-p (session)) (>= now next-data))
+            (incf data-count)
+            (setf next-data (+ now 5000))
+            (let ((payload (probe-payload data-count))
+                  (port (if (echo-enabled-p) 4600 256)))
+              (handler-case
+                  (progn
+                    (setf (getf (car state) :last-probe) payload)
+                    (when (cl-fips:node-send-data node fsp-addr payload :dst-port port :now now)
+                      (out "~6d FSP rekey cutover (ours): the new session is current, K set" (- now t0)))
+                    (out "~6d FSP DataPacket ~d sent (dst_port ~d)" (- now t0) data-count port))
+                (cl-fips:node-error (e)
+                  (out "~6d FSP probe ~d NOT SENT: ~a" (- now t0) data-count e)))))
+          ;; input
+          (when (or (listen (usocket:socket-stream sock))
+                    (usocket:wait-for-input sock :timeout 0.2 :ready-only t))
+            (dolist (ev (cl-fips:node-receive node link :timeout-ms 10000 :now (ms)))
+              (when (eq (first ev) :frame) (pushnew (second ev) seen))
+              (log-event ev t0 state)
+              (when (eq (first ev) :link-closed) (setf deadline 0)))))))
     (let ((m (cl-fips::mmp-metrics (cl-fips:stream-link-mmp link))))
-      (out "MMP: sent ~d ReceiverReports, ~d SenderReports; node's RRs accepted ~d of ~d, RTT samples ~d, srtt ~,1f ms"
-           (getf *stats* :rr-sent 0) (getf *stats* :sr-sent 0)
+      (out "MMP: node's RRs accepted ~d of ~d, RTT samples ~d, srtt ~,1f ms"
            (cl-fips::mm-reports-accepted m) (cl-fips::mm-reports-seen m)
            (cl-fips::mm-rtt-samples m) (/ (cl-fips::mm-srtt-us m) 1000.0)))
     (out "REKEY-SUMMARY answered=~d complete=~d cutover=~d adopted=~d frames-after-last-rotation=~a"
@@ -339,6 +273,7 @@
          (node (read-key (format nil "~a/node.key" dir)))
          (static (secp256k1-fast.ecdh:keypair-from-secret (first lisp)))
          (epoch (natrium:random-bytes 8))
+         (lnode (cl-fips:make-fips-node static))
          (listener (and (eq role :accept)
                         (usocket:socket-listen "127.0.0.1" port :reuse-address t
                                                                 :element-type '(unsigned-byte 8))))
@@ -355,16 +290,19 @@
       (handler-case
           (setf link (if (eq role :accept)
                          (cl-fips:stream-link-accept port static epoch :timeout-ms 10000
-                                                     :reports (reports-mode) :routing (routing-mode))
+                                                     :reports (reports-mode)
+                                                     :routing (and (routing-mode) (cl-fips:fips-node-tree lnode)))
                          (cl-fips:stream-link-initiate port static (second node) epoch
-                                                       :timeout-ms 10000 :reports (reports-mode) :routing (routing-mode))))
+                                                       :timeout-ms 10000 :reports (reports-mode)
+                                                       :routing (and (routing-mode) (cl-fips:fips-node-tree lnode)))))
         (error (e) (out "FAIL: handshake: ~a" e) (sb-ext:exit :code 1))))
     (out "REPORTS mode=~(~a~)" (reports-mode))
     (out "HANDSHAKE OK role=~(~a~) our_index=~8,'0x their_index=~8,'0x remote_epoch=~a"
          role (cl-fips:stream-link-our-index link) (cl-fips:stream-link-their-index link)
          (hex (cl-fips:stream-link-remote-epoch link)))
+    (cl-fips:node-add-link lnode link)
     (let* ((static-ok (equalp (cl-fips:stream-link-remote-static link) (second node)))
-           (seen (exchange link sock secs static (second node)))
+           (seen (exchange lnode link sock secs (second node)))
            (ok (and static-ok (member #x10 seen) (member #x51 seen))))
       (cl-fips:stream-link-close link)
       (out "remote static is the node's key: ~:[NO~;yes~]" static-ok)
@@ -395,131 +333,71 @@
         do (cond ((< x y) (return t)) ((> x y) (return nil)))
         finally (return nil)))
 
-(defstruct transit-state
-  l1 l2 own b-addr static node-b fi (primed nil) (fwd 0) (no-route 0) (ttl 0) (local 0) (t0 0))
-
-(defun transit-filters (ts)
-  (list (cons (transit-state-l1 ts) (cl-fips:stream-link-peer-filter (transit-state-l1 ts)))
-        (cons (transit-state-l2 ts) (cl-fips:stream-link-peer-filter (transit-state-l2 ts)))))
-
-(defun transit-forward (ts link body)
-  "A SessionDatagram that is not for us: next hop from the peers' filters, TTL down
-   by one, path_mtu capped at the outgoing MTU."
-  (let* ((dest (cl-fips:sd-dest body))
-         (target (cl-fips:route-next-hop (transit-filters ts) link dest)))
-    (if (null target)
-        (incf (transit-state-no-route ts))
-        (let ((out-body (cl-fips:sd-forward-header body 1400)))
-          (cond
-            ((null out-body) (incf (transit-state-ttl ts)))
-            (t
-             (cl-fips:stream-link-send target
-                                       (concatenate '(vector (unsigned-byte 8))
-                                                    (vector #x00) out-body))
-             (incf (transit-state-fwd ts))
-             (when (<= (transit-state-fwd ts) 6)
-               (out "~6d FORWARD datagram ttl=~d (to ~:[B~;A~])"
-                    (- (ms) (transit-state-t0 ts)) (cl-fips:sd-ttl out-body)
-                    (eq target (transit-state-l1 ts))))))))))
-
-(defun transit-local (ts link body)
-  "A SessionDatagram for us.  Our SessionAck (from B) completes the session we
-   primed.  Anything else addressed to us -- an error signal a transit node sends
-   back to a source it could not route for, such as A -- is logged and ignored."
-  (incf (transit-state-local ts))
-  (let ((fi (transit-state-fi ts)))
-    (cond
-      ((and fi (eq (cl-fips:fsp-initiator-phase fi) :setup-sent)
-            (equalp (cl-fips:sd-src body) (transit-state-b-addr ts)))
-       (cl-fips:stream-link-send link (cl-fips:fsp-handle-ack fi body))
-       (out "~6d FSP session with B established through the middle"
-            (- (ms) (transit-state-t0 ts))))
-      (t
-       (out "~6d local SessionDatagram from ~a ignored (not our peer's SessionAck)"
-            (- (ms) (transit-state-t0 ts))
-            (hex (cl-fips:sd-src body)))))))
-
-(defun transit-receive (ts link)
-  (handler-case
-      (let ((m (cl-fips:stream-link-receive link :timeout-ms 2000)))
-        ;; the tree is shared: a change learned on one link changes both announces
-        (setf (cl-fips:stream-link-tree-dirty (transit-state-l1 ts)) t
-              (cl-fips:stream-link-tree-dirty (transit-state-l2 ts)) t)
-        (when (and m (= (aref m 0) #x00))
-          (let ((body (subseq m 1)))
-            (if (equalp (cl-fips:sd-dest body) (transit-state-own ts))
-                (transit-local ts link body)
-                (transit-forward ts link body)))))
-    (cl-fips:link-error (e) (out "~6d link error: ~a" (- (ms) (transit-state-t0 ts)) e))
-    (error (e) (out "~6d FAIL: ~a" (- (ms) (transit-state-t0 ts)) e))))
-
-(defun transit-prime (ts)
-  "Once our coordinates exist, one SessionSetup toward B goes out through A."
-  (let* ((l1 (transit-state-l1 ts))
-         (tree (cl-fips:stream-link-tree l1)))
-    (when (and (not (transit-state-primed ts)) tree (cl-fips:tree-state-entries tree))
-      (let ((fi (cl-fips:make-fsp-initiator
-                 (transit-state-static ts) (second (transit-state-node-b ts))
-                 (natrium:random-bytes 8) (transit-state-own ts) (transit-state-b-addr ts)
-                 (mapcar #'cl-fips:coord-entry-node (cl-fips:tree-state-entries tree))
-                 (list (transit-state-b-addr ts)))))
-        (setf (transit-state-fi ts) fi
-              (transit-state-primed ts) t)
-        (cl-fips:stream-link-send l1 (cl-fips:fsp-setup-datagram fi (ms)))
-        (out "~6d SessionSetup toward B sent through A" (- (ms) (transit-state-t0 ts)))))))
-
 (defun run-transit (dir port-a port-l secs)
-  "Lisp as the MIDDLE node: a link to relay A (dialled), and a link B dials into
-   (accepted).  Frames are forwarded between the two.  Once, a SessionSetup toward
-   B goes out through A, so A learns B's coordinates from it and can route to B."
+  "Lisp as the MIDDLE node: one node with two links, one to relay A (dialled) and
+   one B dials into (accepted).  The node forwards SessionDatagrams between them.
+   Once, a session toward B is opened through A, so A learns B's coordinates from
+   its SessionSetup and can route to B itself."
   (let* ((lisp (read-key (format nil "~a/lisp.key" dir)))
          (static (secp256k1-fast.ecdh:keypair-from-secret (first lisp)))
          (node-a (read-key (format nil "~a/node.key" dir)))
          (node-b (read-key (format nil "~a/b/node.key" dir)))
-         (own (cl-fips:node-addr (secp256k1-fast.ecdh:keypair-public-bytes static)))
-         (epoch (natrium:random-bytes 8))
+         (b-addr (cl-fips:node-addr (second node-b)))
+         (lnode (cl-fips:make-fips-node static))
+         (tree (cl-fips:fips-node-tree lnode))
          (s1 (usocket:socket-connect "127.0.0.1" port-a :element-type '(unsigned-byte 8)
                                                         :nodelay t :timeout 10))
-         ;; one tree for the node, shared by both links: it sees both peers' announces
-         (tree (cl-fips:make-tree-state (secp256k1-fast.ecdh:keypair-secret static)))
          (l1 (cl-fips:stream-link-initiate (cl-fips.transport:socket-byte-port s1) static
-                                           (second node-a) epoch :timeout-ms 10000 :routing tree))
+                                           (second node-a) (natrium:random-bytes 8)
+                                           :timeout-ms 10000 :routing tree))
          (listener (usocket:socket-listen "127.0.0.1" port-l :reuse-address t
-                                                             :element-type '(unsigned-byte 8))))
+                                                             :element-type '(unsigned-byte 8)))
+         (t0 (ms)) (primed nil) (local 0))
+    (cl-fips:node-add-link lnode l1)
     (out "HANDSHAKE OK role=dial (to A)")
     (out "LISTENING 127.0.0.1:~d" port-l)
     (unless (usocket:wait-for-input listener :timeout 120 :ready-only t)
       (out "FAIL: B never dialled in") (sb-ext:exit :code 1))
     (let* ((s2 (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
-           (l2 (cl-fips:stream-link-accept (cl-fips.transport:socket-byte-port s2) static epoch
-                                           :timeout-ms 10000 :routing tree))
-           (ts (make-transit-state :l1 l1 :l2 l2 :own own :static static :node-b node-b
-                                   :b-addr (cl-fips:node-addr (second node-b)) :t0 (ms))))
+           (l2 (cl-fips:stream-link-accept (cl-fips.transport:socket-byte-port s2) static
+                                           (natrium:random-bytes 8) :timeout-ms 10000 :routing tree))
+           (deadline (+ (ms) (* 1000 secs))))
       (usocket:socket-close listener)
+      (cl-fips:node-add-link lnode l2)
       (out "HANDSHAKE OK role=accept (from B)")
-      (setf (cl-fips:stream-link-filter-source l1) (lambda (l) (cl-fips:route-filter-for own (transit-filters ts) l))
-            (cl-fips:stream-link-filter-source l2) (lambda (l) (cl-fips:route-filter-for own (transit-filters ts) l)))
-      (let ((next-hb 0) (deadline (+ (ms) (* 1000 secs))))
-        (loop while (< (ms) deadline) do
-          (when (>= (ms) next-hb)
-            (cl-fips:stream-link-send l1 (coerce #(#x51) '(vector (unsigned-byte 8))))
-            (cl-fips:stream-link-send l2 (coerce #(#x51) '(vector (unsigned-byte 8))))
-            (setf next-hb (+ (ms) 5000)))
-          (cl-fips:stream-link-poll l1)
-          (cl-fips:stream-link-poll l2)
-          (transit-prime ts)
-          (let ((fi (transit-state-fi ts)))
-            (when fi
-              (let ((again (cl-fips:fsp-resend-setup fi (ms))))
-                (when again (cl-fips:stream-link-send l1 again)))))
+      (loop while (< (ms) deadline) do
+        (let ((now (ms)))
+          (dolist (ev (cl-fips:node-tick lnode now))
+            (when (eq (first ev) :setup-resent) nil))
+          ;; one session toward B, through A, once our coordinates exist
+          (when (and (not primed) (>= (- now t0) 6000)
+                     (cl-fips:tree-state-entries tree))
+            (setf primed t)
+            (cl-fips:node-open-session lnode (second node-b) :via l1 :now now
+                                                             :peer-coords (list b-addr))
+            (out "~6d SessionSetup toward B sent through A" (- now t0)))
           (dolist (sock (usocket:wait-for-input (list s1 s2) :timeout 0.1 :ready-only t))
-            (transit-receive ts (if (eq sock s1) l1 l2))))
-        (out "TRANSIT forwarded=~d dropped-no-route=~d dropped-ttl=~d local=~d primed=~:[no~;yes~]"
-             (transit-state-fwd ts) (transit-state-no-route ts) (transit-state-ttl ts)
-             (transit-state-local ts) (transit-state-primed ts))
-        (cl-fips:stream-link-close l1)
-        (cl-fips:stream-link-close l2)
-        (sb-ext:exit :code 0)))))
+            (dolist (ev (cl-fips:node-receive lnode (if (eq sock s1) l1 l2) :timeout-ms 2000 :now (ms)))
+              (case (first ev)
+                (:forwarded
+                 (when (<= (cl-fips:fips-node-forwarded lnode) 6)
+                   (out "~6d FORWARD datagram ttl=~d (to ~:[B~;A~])"
+                        (- (ms) t0) (third ev) (eq (fourth ev) l1))))
+                (:established
+                 (incf local)
+                 (out "~6d FSP session with B established through the middle" (- (ms) t0)))
+                (:unsolicited
+                 (incf local)
+                 (out "~6d local SessionDatagram from ~a ignored (no session with it)"
+                      (- (ms) t0) (hex (second ev))))
+                (:link-closed (out "~6d link closed: ~(~a~)" (- (ms) t0) (second ev)))
+                (:session-error (out "~6d FSP: ~a" (- (ms) t0) (third ev)))))))))
+    (out "TRANSIT forwarded=~d dropped-no-route=~d dropped-ttl=~d too-big=~d malformed=~d local=~d primed=~:[no~;yes~]"
+         (cl-fips:fips-node-forwarded lnode) (cl-fips:fips-node-no-route lnode)
+         (cl-fips:fips-node-ttl-expired lnode) (cl-fips:fips-node-too-big lnode)
+         (cl-fips:fips-node-malformed lnode) local primed)
+    (dolist (l (cl-fips:fips-node-links lnode)) (cl-fips:node-remove-link lnode l))
+    (sb-ext:exit :code 0)))
 
 (let* ((args (rest sb-ext:*posix-argv*)) (mode (first args)))
   (cond ((string= mode "keygen") (keygen (second args)))

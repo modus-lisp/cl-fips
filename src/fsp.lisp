@@ -458,3 +458,46 @@
           (return-from fsp-open-any (values-list opened))))
       ;; nothing opened: report the failure the way FSP-OPEN-DATA does
       (fsp-open-data cur wire))))
+
+;;; --- sessions a peer opens with us (we are the XK responder) -------------------
+
+(defun fsp-accept-setup (static local-epoch our-addr our-coords datagram-body &key (now 0))
+  "Answer a SessionSetup from a node we hold no session with.  Returns (values
+   session ack-link-message).  The session waits in phase :ACK-SENT for its msg3;
+   the peer's identity is only known once msg3 arrives."
+  (multiple-value-bind (src dest ttl mtu payload) (decode-session-datagram datagram-body)
+    (declare (ignore ttl mtu))
+    (unless (equalp dest our-addr) (error "SessionSetup is not addressed to us"))
+    (multiple-value-bind (phase flags src-coords dest-coords msg1) (decode-fsp-setup-or-ack payload)
+      (declare (ignore flags dest-coords))
+      (unless (= phase 1) (error "expected SessionSetup, got phase ~d" phase))
+      (let ((hs (fips-make-xk-responder static local-epoch)))
+        (natrium.noise:xk-read-message-1 hs msg1)
+        (let ((msg2 (natrium.noise:xk-write-message-2 hs)))
+          (values (%make-fsp-initiator :hs hs :our-addr our-addr :peer-addr src
+                                       :our-coords our-coords :peer-coords src-coords
+                                       :phase :ack-sent :static static :local-epoch local-epoch
+                                       :setup-sent-at now)
+                  (encode-session-datagram our-addr src
+                                           (encode-fsp-setup-or-ack 2 0 our-coords src-coords msg2))))))))
+
+(defun fsp-complete-accept (fi datagram-body)
+  "Consume the msg3 of a session the peer opened.  The source address it claimed
+   must be the node_addr of the key msg3 authenticates (upstream
+   handle_session_msg3, AddrMismatch); otherwise a node could open a session under
+   another node's address.  A msg3 that does not authenticate leaves the
+   handshake as it was."
+  (unless (eq (fsp-initiator-phase fi) :ack-sent) (error "no session is waiting for msg3"))
+  (multiple-value-bind (src dest ttl mtu payload) (decode-session-datagram datagram-body)
+    (declare (ignore dest ttl mtu))
+    (unless (equalp src (fsp-initiator-peer-addr fi)) (error "SessionMsg3 is not from the setup's source"))
+    (let ((hs (fsp-initiator-hs fi)))
+      (natrium.noise:xk-try-read-message-3 hs (decode-fsp-msg3 payload))
+      (let ((key (secp256k1-fast.ecdh:encode-pubkey (natrium.noise:hs-remote-static hs))))
+        (unless (equalp (node-addr key) src)
+          (setf (fsp-initiator-phase fi) :refused)
+          (error "SessionMsg3 source address does not match the authenticated key"))
+        (setf (fsp-initiator-peer-static fi) key
+              (fsp-initiator-session fi) (natrium.noise:handshake-into-session hs)
+              (fsp-initiator-phase fi) :established)
+        t))))

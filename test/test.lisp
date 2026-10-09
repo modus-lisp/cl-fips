@@ -92,6 +92,7 @@
   (test-routing)                        ; routing-test.lisp
   (test-fsp-session)                    ; fsp-test.lisp
   (test-transit)                        ; transit-test.lisp
+  (test-node)                           ; node-test.lisp
   (test-link-local)                     ; link-test.lisp
   (if *tcp-suite*
       (funcall *tcp-suite*)             ; tcp-test.lisp

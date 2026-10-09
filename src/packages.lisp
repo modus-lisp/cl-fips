@@ -33,6 +33,7 @@
            #:make-fsp-initiator #:fsp-initiator-phase #:fsp-initiator-session
            #:fsp-setup-datagram #:fsp-handle-ack #:fsp-data-datagram #:fsp-initiator-our-addr
            #:fsp-handle-rekey-setup #:fsp-handle-rekey-msg3 #:fsp-open-any
+           #:fsp-accept-setup #:fsp-complete-accept
            #:fsp-initiator-previous-session #:fsp-initiator-pending-session #:fsp-initiator-k
            #:fsp-start-rekey #:fsp-handle-rekey-ack #:fsp-resend-setup #:fsp-initiator-setup-tries
            #:fsp-initiator-rekey-hs #:fsp-initiator-our-addr
@@ -42,6 +43,15 @@
            #:route-next-hop #:route-filter-for
            #:stream-link-peer-filter #:stream-link-filter-source #:stream-link-tree-dirty
            #:make-tree-state #:tree-state-p #:tree-forget-peer
+           ;; the node (node.lisp)
+           #:fips-node #:make-fips-node #:fips-node-tree #:fips-node-own #:fips-node-links
+           #:fips-node-forwarded #:fips-node-no-route #:fips-node-ttl-expired
+           #:fips-node-too-big #:fips-node-malformed
+           #:node-error #:node-error-reason
+           #:node-add-link #:node-remove-link #:node-link-peer #:node-route #:node-session
+           #:node-our-coords #:node-peer-coords
+           #:node-open-session #:node-send-data #:node-start-rekey
+           #:node-tick #:node-receive
            #:fips-make-xk-initiator #:fips-make-xk-responder
            ;; FMP established frames (fmp.lisp)
            #:+flag-key-epoch+ #:+flag-ce+ #:+flag-sp+ #:+inner-header-size+

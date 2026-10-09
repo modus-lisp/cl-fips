@@ -27,7 +27,13 @@ A Lisp node can:
   DataPackets both ways, and rekey that session in both directions;
 - send a DataPacket to a node two hops away, through a relay node;
 - act as a middle node: forward SessionDatagrams between two peers, so that two
-  nodes that are not peers of each other can carry a session through it.
+  nodes that are not peers of each other can carry a session through it;
+- accept a session another node opens, binding its source address to the key
+  its handshake authenticates.
+
+All of this is one object, `fips-node` (`src/node.lisp`). The real-node driver
+in `test/` is a thin loop around it: it decides which socket has input, and logs
+the events the node returns.
 
 Every one of these has been checked against the real upstream `fips` binary,
 not only against our own oracle. See [Real-node results](#real-node-results).
@@ -47,6 +53,7 @@ not only against our own oracle. See [Real-node results](#real-node-results).
 | `src/tree.lisp` | Our spanning-tree declaration, from the peers' verified announces |
 | `src/fsp.lisp` | The end-to-end session: SessionDatagram, the XK handshake bodies, DataPacket frames, rekey, drain |
 | `src/route.lisp` | Transit forwarding: TTL and path MTU for a SessionDatagram, the next hop from peers' filters, split horizon |
+| `src/node.lisp` | The node a program runs: its links, one shared tree, the FSP sessions it opens and accepts, and forwarding. Time is passed in, input is handed to it, and it returns events |
 | `src/identity.lisp` | `node_addr` and the FIPS IPv6 address |
 | `transport/tcp.lisp` | The TCP adapter (`usocket`, SBCL only) |
 | `tools/oracle/` | A Rust crate that vendors upstream's Noise and framing code, for interop tests (test tooling only) |

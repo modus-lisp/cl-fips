@@ -12,8 +12,7 @@
 
 (in-package #:cl-fips.test)
 
-(defun octets (&rest xs)
-  (make-array (length xs) :element-type '(unsigned-byte 8) :initial-contents xs))
+;; OCTETS is link-test.lisp's (one definition for the whole test package)
 
 (defun ascii-octets (s)
   (map '(vector (unsigned-byte 8)) #'char-code s))
