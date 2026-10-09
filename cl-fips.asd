@@ -62,6 +62,12 @@
   :depends-on ("cl-fips/transport" (:require "sb-posix"))
   :components ((:module "transport" :components ((:file "daemon")))))
 
+(defsystem "cl-fips/stream"
+  :description "Byte streams over FIPS between cl-fips nodes, a TCP gateway, and
+                cl-transport's :fips backend (SBCL)."
+  :depends-on ("cl-fips/daemon" "cl-transport" "bordeaux-threads")
+  :components ((:module "transport" :components ((:file "fips-stream")))))
+
 (defsystem "cl-fips/transport-test"
   :description "FMP over real TCP against the upstream Rust oracle."
   :depends-on ("cl-fips/test" "cl-fips/transport" "cl-fips/daemon")

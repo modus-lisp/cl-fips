@@ -84,6 +84,31 @@ the events the node returns.
 Every one of these has been checked against the real upstream `fips` binary,
 not only against our own oracle. See [Real-node results](#real-node-results).
 
+## Streams, a gateway, and cl-transport
+
+FIPS carries datagrams. Upstream carries TCP through its IPv6 TUN, which needs
+root and a TUN device. `cl-fips/stream` (`transport/fips-stream.lisp`) instead
+gives two cl-fips nodes a reliable byte stream: a small windowed, acknowledged
+protocol on service port 7100, its own and not upstream's. On top of that it adds
+a TCP gateway, and registers `:fips` as a cl-transport backend:
+
+```lisp
+(cl-fips.stream:start-fips-client (cl-fips.daemon:load-config "client.conf")
+                                  :gateway "npub1...gateway")
+(let ((seal.http:*dial* (lambda (h p tm) (cl-transport:dial h p :transport :fips :timeout tm))))
+  (seal.http:get-string "https://example.com/"))
+```
+
+`scripts/run-seal-over-fips.sh` does exactly that, through a real upstream node
+as the relay in the middle: seal → cl-transport → client node → upstream relay →
+gateway node → example.com. It fetches `https://example.com/` (577 bytes in about
+370 ms) and `https://www.wikipedia.org/` (122 KB in about 670 ms). TLS runs end
+to end, so the relay and the gateway see only ciphertext. A gateway opens TCP
+connections only for the npubs it is given.
+
+Not yet: tests of the stream protocol under loss (it resends, but only loopback
+has exercised it), and a stream service other than the TCP gateway.
+
 ## Layout
 
 | Path | What |
@@ -104,6 +129,7 @@ not only against our own oracle. See [Real-node results](#real-node-results).
 | `src/identity.lisp` | `node_addr` and the FIPS IPv6 address |
 | `transport/tcp.lisp` | The TCP adapter (`usocket`, SBCL only) |
 | `transport/udp.lisp` | The UDP adapter: one socket, its datagrams sorted into per-peer ports (`usocket`, SBCL only) |
+| `transport/fips-stream.lisp` | Byte streams between cl-fips nodes, the TCP gateway, cl-transport's `:fips` (SBCL only) |
 | `transport/daemon.lisp` | The runnable node: config, identity file, listeners, dialling and redialling peers, `daemon-send` (SBCL only) |
 | `tools/oracle/` | A Rust crate that vendors upstream's Noise and framing code, for interop tests (test tooling only) |
 | `scripts/` | The real-node runners |
