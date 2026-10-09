@@ -9,8 +9,8 @@ interoperates with the upstream node. The protocol code in `src/` is portable
 Common Lisp with no FFI, written so that it can also run on modus later. The
 socket adapters and the daemon in `transport/` are SBCL-only and marked as such.
 
-**Status: heading for 1.0, not released yet.** It is unpublished. See
-[Road to 1.0](#road-to-10) for what is left.
+**Status:** the 1.0 roadmap below is complete. The code is unaudited, and its
+constant-time guarantees hold only on SBCL (see [Not implemented](#not-implemented)).
 
 ## Running a node
 
@@ -175,11 +175,19 @@ Not yet: IPv6 for anything but TCP.
 - **secp256k1-fast** (master, ad0705d or later): point arithmetic, the constant-time
   variable-base multiply used by the DH, and the FIPS ECDH and SEC1 codec.
   No dependencies.
-- **usocket**: the TCP adapter only. The protocol code does not use it.
+- **cl-transport** (master, f5c230e or later): `cl-transport/sockets`, the
+  portable UDP and TCP the adapters run on; `cl-transport/tcp` and `:fips` dialling
+  for the stream layer. All on [modus-lisp](https://github.com/modus-lisp).
+- **On modus**: a modus whose `sb-bsd-sockets` layer has unconnected UDP
+  (sendto, recvfrom with the sender) and `sb-sys:wait-until-fd-usable`.
+- **usocket, bordeaux-threads**: the tests' raw-socket client, and the
+  stream/gateway layer (`cl-fips/stream`, SBCL only). Neither the protocol code
+  nor the node needs them.
 - **cargo** (Rust), for the oracle. Only the tests need it.
 
-`run-tests.sh` looks for the two pure-CL dependencies at `$NATRIUM_DIR` and
-`$SECP256K1_DIR`, defaulting to `~/natrium` and `~/secp256k1-fast`.
+`run-tests.sh` and the launchers look for the pure-CL dependencies at
+`$NATRIUM_DIR`, `$SECP256K1_DIR` and `$CL_TRANSPORT_DIR`, defaulting to `~/natrium`,
+`~/secp256k1-fast` and `~/cl-transport`.
 
 ## Running the tests
 
@@ -338,4 +346,5 @@ The real-node runs are the stronger check, since they run the node's own code.
 
 ## Licence
 
-MIT, as the upstream code it vendors.
+MIT (`LICENSE`). The upstream code vendored into `tools/oracle/` is MIT as well,
+copyright Johnathan Corgan; its notice is in `tools/oracle/LICENSE-upstream`.
