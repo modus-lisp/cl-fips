@@ -175,9 +175,18 @@
                (port (if (echo-enabled-p) 4600 256))
                (d (cl-fips:fsp-data-datagram fsp payload :dst-port port
                                                          :timestamp-ms (ldb (byte 32 0) (- (ms) t0)))))
-          (setf last-probe payload)
-          (cl-fips:stream-link-send link d)
-          (out "~6d FSP DataPacket ~d sent (dst_port ~d)" (- (ms) t0) data-count port))
+          ;; a DataPacket is 110 bytes of framing around its data on the link (FMP
+          ;; header and tag, the SessionDatagram header, the FSP header and tag, the
+          ;; inner and port headers); anything above that does not fit the link MTU
+          (let ((limit (- (cl-fips::stream-link-mtu link) 110)))
+            (cond
+              ((> (length payload) limit)
+               (out "~6d FSP probe ~d NOT SENT: ~d bytes exceeds the ~d-byte limit (link MTU ~d less 110)"
+                    (- (ms) t0) data-count (length payload) limit (cl-fips::stream-link-mtu link)))
+              (t
+               (setf last-probe payload)
+               (cl-fips:stream-link-send link d)
+               (out "~6d FSP DataPacket ~d sent (dst_port ~d)" (- (ms) t0) data-count port)))))
         (setf next-data (+ (ms) 5000)))
       (multiple-value-bind (actions reports) (cl-fips:stream-link-poll link)
         (dolist (a actions)
