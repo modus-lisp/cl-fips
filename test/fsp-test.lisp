@@ -436,6 +436,51 @@
         (check "S5: the K bit flips at the first cutover and back at the second"
                (and (not (eq k0 k1)) (eq (fsp-initiator-k fi) k0)))))))
 
+(defun fsp-peer-setup (fi kb ka-pub b dest epoch-byte)
+  "The peer's rekey msg1 as a SessionDatagram body to DEST; returns (values body nh)."
+  (let* ((nh (fips-make-xk-initiator kb ka-pub (make-array 8 :element-type '(unsigned-byte 8) :initial-element epoch-byte)))
+         (m1 (natrium.noise:xk-write-message-1 nh)))
+    (declare (ignore fi))
+    (values (subseq (encode-session-datagram b dest (encode-fsp-setup-or-ack 1 0 (list b) (list dest) m1)) 1)
+            nh)))
+
+(defun test-fsp-rekey-guards ()
+  "Upstream's rules for a SessionSetup that arrives while a rekey is under way."
+  ;; G1: the peer's handshake is held; a second setup cannot displace it
+  (multiple-value-bind (fi ka kb a b) (fsp-keyed-session)
+    (multiple-value-bind (body1 nh1) (fsp-peer-setup fi kb (keypair-public-bytes ka) b a 3)
+      (let ((ack (fsp-handle-rekey-setup fi body1)))
+        (check "G1: a second SessionSetup during a held handshake is refused"
+               (handler-case (progn (fsp-handle-rekey-setup fi (fsp-peer-setup fi (generate-keypair) (keypair-public-bytes ka) b a 4)) nil)
+                 (error () t)))
+        (natrium.noise:xk-read-message-2 nh1 (nth-value 4 (decode-fsp-setup-or-ack (fsp-rekey-ack-payload ack))))
+        (check "G1: the held handshake's genuine msg3 still completes"
+               (fsp-handle-rekey-msg3 fi (subseq (encode-session-datagram b a (encode-fsp-msg3 (natrium.noise:xk-write-message-3 nh1))) 1)))
+        ;; G2: now a rekeyed session waits for its cutover; a setup is refused
+        (check "G2: a SessionSetup while a rekeyed session awaits cutover is refused"
+               (handler-case (progn (fsp-handle-rekey-setup fi (fsp-peer-setup fi kb (keypair-public-bytes ka) b a 5)) nil)
+                 (error () t))))))
+  ;; G3: both sides started a rekey.  Our address (10) is smaller than the peer's (20):
+  ;; we keep the initiator role and refuse theirs
+  (multiple-value-bind (fi ka kb a b) (fsp-keyed-session)
+    (fsp-start-rekey fi)
+    (check "G3: dual rekey, smaller address: their setup is refused"
+           (handler-case (progn (fsp-handle-rekey-setup fi (fsp-peer-setup fi kb (keypair-public-bytes ka) b a 6)) nil)
+             (error () t)))
+    (check "G3: and our rekey stays in flight"
+           (fsp-initiator-rekey-hs fi)))
+  ;; G4: the same with our address larger: ours is dropped and theirs answered
+  (multiple-value-bind (fi ka kb a b) (fsp-keyed-session)
+    (declare (ignore a))
+    (let ((big (fsp-addr 30)))
+      (setf (fsp-initiator-our-addr fi) big)
+      (fsp-start-rekey fi)
+      (check "G4: dual rekey, larger address: their setup is answered"
+             (handler-case (progn (fsp-handle-rekey-setup fi (fsp-peer-setup fi kb (keypair-public-bytes ka) b big 7)) t)
+               (error () nil)))
+      (check "G4: and our own rekey is dropped"
+             (null (fsp-initiator-rekey-hs fi))))))
+
 (defun test-fsp-session ()
   (test-session-datagram)
   (test-coords)
@@ -447,4 +492,5 @@
   (test-fsp-resend-setup)
   (test-fsp-drain)
   (test-fsp-adversarial)
+  (test-fsp-rekey-guards)
   (test-fsp-wrong-peer))

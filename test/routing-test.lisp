@@ -192,7 +192,27 @@
         do (cond ((< x y) (return t)) ((> x y) (return nil)))
         finally (return nil)))
 
+(defun test-tree-forget ()
+  "A forgotten peer is no longer a parent candidate."
+  (let* ((sa (make-tree-state 3)) (sb (make-tree-state 5))
+         (small (if (u8-less-p (tree-state-node sa) (tree-state-node sb)) sa sb))
+         (large (if (eq small sa) sb sa))
+         (small-key (if (eq small sa) 3 5)))
+    (tree-register-peer-key large (tree-state-node small) (secp256k1-fast.schnorr:pubkey-xonly small-key))
+    (tree-recompute small 1000)
+    (multiple-value-bind (d e) (decode-tree-announce (subseq (tree-current-announce small) 1))
+      (tree-observe-announce large d e))
+    (tree-recompute large 1000)
+    (check "forget: before, the larger node's parent is the smaller"
+           (equalp (parent-declaration-parent (tree-state-declaration large)) (tree-state-node small)))
+    (check "forget: forgetting a known peer reports it"
+           (tree-forget-peer large (tree-state-node small)))
+    (tree-recompute large 2000)
+    (check "forget: after, the larger node declares itself root"
+           (parent-declaration-root-p (tree-state-declaration large)))))
+
 (defun test-routing ()
   (test-bloom)
   (test-tree-announce)
-  (test-tree-two-nodes))
+  (test-tree-two-nodes)
+  (test-tree-forget))

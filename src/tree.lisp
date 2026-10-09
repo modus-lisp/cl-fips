@@ -108,3 +108,11 @@
   (let ((decl (tree-state-declaration state)))
     (when decl
       (encode-tree-announce decl (tree-state-entries state)))))
+
+(defun tree-forget-peer (state node)
+  "Drop a peer whose link has gone: its announce stops counting, so it can no
+   longer be chosen as parent, and its key is forgotten.  Returns T if it was known."
+  (let ((known (gethash node (tree-state-peers state))))
+    (remhash node (tree-state-peers state))
+    (remhash node (tree-state-keys state))
+    (and known t)))

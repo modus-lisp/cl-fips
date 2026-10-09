@@ -271,6 +271,20 @@
    SessionDatagram body that carries SessionAck (XK msg2)."
   (unless (eq (fsp-initiator-phase fi) :established)
     (error "a rekey needs an established session"))
+  (fsp-expire-handshakes fi now)
+  ;; upstream node/handlers/session.rs: a setup does not displace a rekey already
+  ;; under way.  The source address is not authenticated, so without these a
+  ;; forged SessionSetup could discard the handshake the peer's genuine msg3 needs.
+  (cond
+    ((fsp-initiator-pending-session fi)
+     (error "a rekeyed session is waiting for its cutover"))          ; RekeyPending
+    ((fsp-initiator-pending-hs fi)
+     (error "the peer's rekey handshake is held until its msg3"))     ; RekeyHeld
+    ((fsp-initiator-rekey-hs fi)
+     ;; both sides started a rekey: the smaller node_addr stays initiator
+     (if (bytes< (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi))
+         (error "dual rekey: we keep the initiator role")
+         (setf (fsp-initiator-rekey-hs fi) nil))))
   (multiple-value-bind (src dest ttl mtu payload) (decode-session-datagram datagram-body)
     (declare (ignore ttl mtu))
     (unless (and (equalp src (fsp-initiator-peer-addr fi))

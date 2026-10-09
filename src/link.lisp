@@ -371,6 +371,11 @@
       (values actions (nreverse sent)))))
 
 (defun stream-link-close (link)
+  "Close the link.  With routing, the peer leaves our tree: a shared tree must not
+   keep a dead link's peer as a parent candidate."
+  (let ((tree (stream-link-tree link)))
+    (when tree
+      (tree-forget-peer tree (node-addr (stream-link-remote-static link)))))
   (byte-port-close (stream-link-port link)))
 
 ;;; --- An in-memory port (tests; also a template for a new adapter) ----------------

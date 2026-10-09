@@ -35,12 +35,13 @@
            #:fsp-handle-rekey-setup #:fsp-handle-rekey-msg3 #:fsp-open-any
            #:fsp-initiator-previous-session #:fsp-initiator-pending-session #:fsp-initiator-k
            #:fsp-start-rekey #:fsp-handle-rekey-ack #:fsp-resend-setup #:fsp-initiator-setup-tries
+           #:fsp-initiator-rekey-hs #:fsp-initiator-our-addr
            #:fsp-expire-previous #:fsp-previous-live-p
            ;; transit forwarding (route.lisp) and the link's filter hooks
            #:sd-ttl #:sd-path-mtu #:sd-src #:sd-dest #:sd-forward-header
            #:route-next-hop #:route-filter-for
            #:stream-link-peer-filter #:stream-link-filter-source #:stream-link-tree-dirty
-           #:make-tree-state #:tree-state-p
+           #:make-tree-state #:tree-state-p #:tree-forget-peer
            #:fips-make-xk-initiator #:fips-make-xk-responder
            ;; FMP established frames (fmp.lisp)
            #:+flag-key-epoch+ #:+flag-ce+ #:+flag-sp+ #:+inner-header-size+
