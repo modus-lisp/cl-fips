@@ -55,8 +55,9 @@
                                      (progn (incf ok) (remhash (text data) sent)
                                             (format t "ECHO OK ~s~%" (text data)))
                                      (progn (incf bad) (format t "ECHO MISMATCH ~s~%" (text data)))))
-                                ((equalp peer node-addr)
-                                 (format t "DATA from the node src_port=~d dst_port=~d data=~s~%"
+                                (t
+                                 (format t "DATA from ~:[~(~{~2,'0x~}~)~;the node~*~] src_port=~d dst_port=~d data=~s~%"
+                                         (equalp peer node-addr) (coerce (subseq peer 0 4) 'list)
                                          sp dp (text data)))))))
                          (finish-output)))))
     (cl-fips.daemon:daemon-start d)

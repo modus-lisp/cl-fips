@@ -6,8 +6,8 @@
 ;;;; codecs are plain octet arithmetic so the same file can later run on modus.
 
 (defsystem "cl-fips"
-  :description "FIPS wire codecs and the Noise IK handshake (FMP link layer) in pure CL."
-  :version "0.1.0"
+  :description "A FIPS (Free Internetworking Peering System) node in portable Common Lisp."
+  :version "0.9.0"
   :author "ynniv"
   :license "MIT"
   ;; Both are pure CL with no FFI: natrium (SHA-256, HKDF, ChaCha20-Poly1305,

@@ -108,6 +108,7 @@
   (accepting '())                       ; ((socket . port) ...) TCP, msg1 not yet read
   (peers '())
   (pending (make-hash-table :test 'equalp)) ; node_addr -> list of (data src dst)
+  (awaiting (make-hash-table :test 'equalp)) ; node_addr -> key, a lookup before an open
   (echo-ports '())
   (on-event nil)                        ; (lambda (daemon event)) or NIL
   (log *standard-output*)
@@ -277,6 +278,14 @@
     (case (first ev)
       (:link-closed (%forget-link d (third ev)))
       ((:established :accepted) (%flush-pending d (second ev)))
+      ((:lookup-ok :lookup-failed)
+       ;; open the session the lookup was for; a failed lookup still tries, with
+       ;; the target as its own coordinates (a node on the way may know better)
+       (let ((key (gethash (second ev) (daemon-awaiting d))))
+         (when key
+           (remhash (second ev) (daemon-awaiting d))
+           (unless (cl-fips:node-session (daemon-node d) (second ev))
+             (cl-fips:node-open-session (daemon-node d) key :now (daemon-now d))))))
       (:data
        (destructuring-bind (peer sp dp data ts) (rest ev)
          (declare (ignore ts))
@@ -451,7 +460,15 @@
          (when (>= (length (gethash addr (daemon-pending d))) +max-pending-sends+)
            (error 'cl-fips:node-error :reason :queue-full))
          (push (list data src-port dst-port) (gethash addr (daemon-pending d)))
-         (unless fi (cl-fips:node-open-session node key :now now))
+         (unless fi
+           (if (or (cl-fips:node-cached-coords node addr)
+                   (cl-fips:node-peer-coords node addr)
+                   (find addr (cl-fips:fips-node-links node) :key #'cl-fips:node-link-peer :test #'equalp))
+               (cl-fips:node-open-session node key :now now)
+               ;; a node we know only by key: ask the mesh where it is first
+               (unless (gethash addr (daemon-awaiting d))
+                 (setf (gethash addr (daemon-awaiting d)) key)
+                 (cl-fips:node-lookup node key :now now))))
          :queued)))))
 
 ;;; --- the command line ------------------------------------------------------------

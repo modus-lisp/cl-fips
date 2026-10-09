@@ -4,20 +4,64 @@ A pure-Common-Lisp client for FIPS, the Free Internetworking Peering System
 ([learn.fips.network](https://learn.fips.network); reference implementation
 [jmcorgan/fips](https://github.com/jmcorgan/fips), pinned at commit `57bc510`).
 
-The point is to run as a peer on modus, which has no FFI, no Linux and no Rust.
-Development and tests run on SBCL. The protocol code in `src/` makes no
-SBCL-specific calls. The socket adapter in `transport/` is SBCL-only and marked
-as such.
+It runs as a FIPS node on SBCL on Linux, over UDP (FIPS's default) and TCP, and
+interoperates with the upstream node. The protocol code in `src/` is portable
+Common Lisp with no FFI, written so that it can also run on modus later. The
+socket adapters and the daemon in `transport/` are SBCL-only and marked as such.
 
-**Status: a development snapshot, not a release.** It is unpublished, and the
-protocol is not complete (see [Not implemented](#not-implemented)).
+**Status: heading for 1.0, not released yet.** It is unpublished. See
+[Road to 1.0](#road-to-10) for what is left.
+
+## Running a node
+
+```sh
+mkdir -p ~/.cl-fips
+scripts/cl-fips-node keygen ~/.cl-fips/fips.key     # prints your npub
+scripts/cl-fips-node run ~/.cl-fips/node.conf
+```
+
+with `~/.cl-fips/node.conf`:
+
+```lisp
+(:identity (:key-file "fips.key")
+ :udp (:bind "0.0.0.0:2121")
+ :peers ((:npub "npub1..." :transport :udp :addr "198.51.100.7:2121" :alias "relay")))
+```
+
+The config is a Lisp property list, read with `*read-eval*` off. Relative paths are
+resolved against the config file's directory.
+
+| Key | Meaning |
+|---|---|
+| `:identity (:key-file F)` | The node's secret: an nsec (or 64 hex digits) on the first line of F, as in upstream's `fips.key`. If F is absent it is created with mode 0600, and F's npub is written to `F.pub`. Without this key, a fresh identity is used each run |
+| `:udp (:bind "host:port")` | Listen on UDP (upstream's default is `0.0.0.0:2121`; MTU 1280). Also needed to dial UDP peers |
+| `:tcp (:bind "host:port")` | Listen on TCP (MTU 1400) |
+| `:peers (...)` | Peers to dial: `:npub`, `:transport` (`:udp` or `:tcp`), `:addr "host:port"`, optional `:alias`. A dropped peer is redialled, backing off from 1 s to 60 s |
+| `:echo-ports (N ...)` | Answer DataPackets on these ports with the same bytes (to test reachability) |
+
+From Lisp, load `cl-fips/daemon` and drive it:
+
+```lisp
+(let ((d (cl-fips.daemon:make-daemon (cl-fips.daemon:load-config "node.conf")
+                                     :on-event (lambda (d ev) (declare (ignore d)) (print ev)))))
+  (cl-fips.daemon:daemon-start d)
+  (cl-fips.daemon:daemon-send d "npub1..." (map '(vector (unsigned-byte 8)) #'char-code "hi")
+                              :dst-port 4600)
+  (cl-fips.daemon:daemon-run d))      ; or call DAEMON-STEP from your own loop
+```
+
+`DAEMON-SEND` takes an npub. With no session yet, it looks the target up, opens
+a session, and sends once the session is up. Data that arrives comes as an
+`(:data PEER SRC-PORT DST-PORT BYTES TIMESTAMP)` event. Underneath the daemon,
+`fips-node` (`src/node.lisp`) is the same machine without the I/O policy: you hand
+it packets and a clock, and it returns events.
 
 ## What it does
 
 A Lisp node can:
 
-- complete a Noise IK handshake (the link layer) with a FIPS node over TCP,
-  in either direction;
+- link to FIPS nodes over UDP or TCP, in either direction. On a lossy transport
+  it resends its handshake, and it notices a peer that has gone silent;
 - carry established link frames, with the replay window, rekey and the K-bit
   cutover;
 - send MMP reports and read the node's;
@@ -29,7 +73,9 @@ A Lisp node can:
 - act as a middle node: forward SessionDatagrams between two peers, so that two
   nodes that are not peers of each other can carry a session through it;
 - accept a session another node opens, binding its source address to the key
-  its handshake authenticates.
+  its handshake authenticates;
+- find a node it knows only by npub (LookupRequest / LookupResponse, with the
+  target's signed proof), answer lookups for itself, and pass others on.
 
 All of this is one object, `fips-node` (`src/node.lisp`). The real-node driver
 in `test/` is a thin loop around it: it decides which socket has input, and logs
@@ -52,10 +98,13 @@ not only against our own oracle. See [Real-node results](#real-node-results).
 | `src/bloom.lisp` | The reachability filter and the FilterAnnounce codec |
 | `src/tree.lisp` | Our spanning-tree declaration, from the peers' verified announces |
 | `src/fsp.lisp` | The end-to-end session: SessionDatagram, the XK handshake bodies, DataPacket frames, rekey, drain |
+| `src/lookup.lisp` | Coordinate discovery: LookupRequest / LookupResponse codecs and the signed proof |
 | `src/route.lisp` | Transit forwarding: TTL and path MTU for a SessionDatagram, the next hop from peers' filters, split horizon |
 | `src/node.lisp` | The node a program runs: its links, one shared tree, the FSP sessions it opens and accepts, and forwarding. Time is passed in, input is handed to it, and it returns events |
 | `src/identity.lisp` | `node_addr` and the FIPS IPv6 address |
 | `transport/tcp.lisp` | The TCP adapter (`usocket`, SBCL only) |
+| `transport/udp.lisp` | The UDP adapter: one socket, its datagrams sorted into per-peer ports (`usocket`, SBCL only) |
+| `transport/daemon.lisp` | The runnable node: config, identity file, listeners, dialling and redialling peers, `daemon-send` (SBCL only) |
 | `tools/oracle/` | A Rust crate that vendors upstream's Noise and framing code, for interop tests (test tooling only) |
 | `scripts/` | The real-node runners |
 | `test/` | The test suite and the real-node driver |
@@ -94,6 +143,8 @@ then:
 FIPS_BIN=/path/to/fips scripts/run-real-node.sh 150
 FIPS_BIN=/path/to/fips ECHO_BIN=/path/to/native-echo scripts/run-real-node-multihop.sh 60
 FIPS_BIN=/path/to/fips ECHO_BIN=/path/to/native-echo SEND_BIN=/path/to/native-send scripts/run-real-node-transit.sh 90
+FIPS_BIN=/path/to/fips scripts/run-real-node-udp.sh 40       # the daemon over UDP, both directions
+FIPS_BIN=/path/to/fips scripts/run-real-node-lookup.sh 45    # lookups both ways through a relay
 ```
 
 `native-echo` is upstream's `examples/native-echo`, built beside the binary. It
@@ -137,6 +188,15 @@ these come from):
   rekey its session and it completes. The node logs the cutover in both cases.
 - **Transit.** Node A to Lisp to node B. Lisp forwards 241 SessionDatagrams,
   B establishes a session from A, and its echo returns A's probe through Lisp.
+- **UDP, through the daemon.** The daemon dials the node, and the node dials the
+  daemon. In both cases the node promotes the peer and processes our heartbeats
+  and ReceiverReports. Its echo returns every probe (19 of 19, then 18 of 18),
+  and a flow the node opens reaches us.
+- **Lookup.** The daemon is linked only to relay A, and knows B only by its npub.
+  It looks B up through A, verifies B's proof, and opens the session with B's
+  coordinates; B echoes 22 of 22 probes. In the other direction, node C looks
+  the daemon up. We answer, C logs "Discovery succeeded, proof verified", and
+  C's datagram reaches us.
 - **Two hops.** Lisp to relay A to node B. B establishes the session through A,
   and its echo returns 12 of 12 probes byte for byte.
 
@@ -145,20 +205,38 @@ these come from):
 - **Upstream's coordinate tie-break in routing.** A transit node forwards by its
   peers' bloom filters only. Upstream also weighs tree distance, and it returns
   error signals to a source it cannot route for. We ignore those signals.
-- **Coordinate discovery.** We send `[destination]` as the destination's
-  coordinates when we have no better path, and we do not run upstream's lookup.
-  A node learns a destination's coordinates from a SessionSetup that passes
-  through it, which is how the transit test works.
-- **Retransmission** of our link msg1 (the node does retransmit its own).
+- **Lookup backoff and coordinate-cache expiry.** Looked-up coordinates are
+  kept for the life of the node, and a failed lookup is not suppressed before
+  it is retried.
+- **Link msg1 retransmission on TCP.** On UDP, msg1 is resent at 1, 3, 7 and 15 s.
+  TCP is reliable: an unanswered dial is abandoned after 30 s and redialled.
   Our SessionSetup is resent every 4 s, up to 10 times.
+- **Cross-connection tie-break.** If two daemons dial each other at the same
+  moment over UDP, each drops the other's msg1. Both dials time out, and the
+  jittered redial separates them.
 - **Reading the peers' filters** for routing decisions, and parent hysteresis,
   flap dampening and cost-based parent choice.
 - **Path-MTU exchange and fragmentation.** A DataPacket larger than about 1290 bytes
   is refused locally.
 - **Multi-relay and route-change tests.** The two-hop test has one relay, and the
   transit test has one middle node.
+- **IPv6 / TUN.** Applications use the Lisp API, not a network interface.
+- **NAT traversal, Nostr discovery, the Tor and BLE transports, and the native
+  API socket.**
 - **Running on modus.** The protocol code is written to be portable, but nothing
   has been run on modus. The tests use `sb-ext`, and the transport uses `usocket`.
+
+## Road to 1.0
+
+For SBCL on Linux:
+
+- [x] UDP transport, with handshake resends and dead-link detection
+- [x] Coordinate lookup, checked against real nodes in both directions
+- [x] A runnable node: config, persistent identity, listeners, redial
+- [ ] Repeated real-node runs with recorded pass rates
+- [ ] A second independent review (FSP, MMP, the transports, lookup, the daemon)
+- [ ] Merge the `fips-noise` branches of natrium and secp256k1-fast, document
+      the API, and tag
 
 ## Interop and the oracle
 
