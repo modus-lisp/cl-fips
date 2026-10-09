@@ -110,6 +110,19 @@
 (defvar *stats* nil)
 (defun bump (key) (incf (getf *stats* key 0)))
 
+(defun probe-payload (n)
+  "CL_FIPS_PROBE_BYTES: the probe's size (default 15, the text alone).  Larger
+   probes are padded with a repeating pattern, so an echo that truncates or
+   mangles the body shows up as a mismatch."
+  (let* ((text (natrium:ascii->bytes (format nil "cl-fips probe ~d" n)))
+         (want (let ((v (sb-ext:posix-getenv "CL_FIPS_PROBE_BYTES")))
+                 (if (and v (plusp (length v))) (parse-integer v) (length text))))
+         (out (make-array (max want (length text)) :element-type '(unsigned-byte 8))))
+    (replace out text)
+    (loop for i from (length text) below (length out)
+          do (setf (aref out i) (+ 97 (mod (+ i n) 26))))
+    out))
+
 (defun echo-enabled-p ()
   "CL_FIPS_ECHO: unset or \"on\" = probe the node's native-echo on port 4600
    (the default); \"off\" = probe the IPv6 shim on port 256."
@@ -158,7 +171,7 @@
         ;; CL_FIPS_ECHO=on (default): the probe goes to port 4600, which the node's
         ;; native-echo holds, so the node sends the bytes back; otherwise the IPv6
         ;; shim (256) decrypts and rejects them.
-        (let* ((payload (natrium:ascii->bytes (format nil "cl-fips probe ~d" data-count)))
+        (let* ((payload (probe-payload data-count))
                (port (if (echo-enabled-p) 4600 256))
                (d (cl-fips:fsp-data-datagram fsp payload :dst-port port
                                                          :timestamp-ms (ldb (byte 32 0) (- (ms) t0)))))
