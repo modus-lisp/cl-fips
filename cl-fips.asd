@@ -28,6 +28,7 @@
                              (:file "fsp")
                              (:file "route")
                              (:file "lookup")
+                             (:file "ipv6-shim")
                              (:file "link")
                              (:file "node"))))
   :in-order-to ((test-op (test-op "cl-fips/test"))))
@@ -65,7 +66,7 @@
 (defsystem "cl-fips/stream"
   :description "Byte streams over FIPS between cl-fips nodes, a TCP gateway, and
                 cl-transport's :fips backend (SBCL)."
-  :depends-on ("cl-fips/daemon" "cl-transport" "bordeaux-threads")
+  :depends-on ("cl-fips/daemon" "cl-transport" "cl-transport/tcp" "bordeaux-threads")
   :components ((:module "transport" :components ((:file "fips-stream")))))
 
 (defsystem "cl-fips/transport-test"

@@ -29,7 +29,7 @@
 
 (defpackage #:cl-fips.stream
   (:use #:common-lisp)
-  (:local-nicknames (#:bt #:bordeaux-threads) (#:d #:cl-fips.daemon))
+  (:local-nicknames (#:bt #:bordeaux-threads) (#:d #:cl-fips.daemon) (#:tcp #:cl-transport.tcp))
   (:export #:start-fips-client #:start-fips-gateway #:stop-fips-endpoint #:fips-dial
            #:*fips-client* #:+stream-port+ #:endpoint-daemon #:run-gateway-main))
 
@@ -72,6 +72,8 @@
   (expect 0) (ooo (make-hash-table)) (inbox '()) (eof nil) (ack-due nil)
   ;; the gateway's side: the TCP socket it bridges to
   socket (tcp-eof nil)
+  ;; a stream to a FIPS node's own TCP, through the IPv6 shim: our TCP engine
+  tcp
   (cv (bt:make-condition-variable)))
 
 (defstruct (endpoint (:constructor %make-endpoint))
@@ -106,7 +108,50 @@
              t)
     (error () nil)))
 
+(defun %pump-tcp (c now)
+  "Move bytes between the caller's queues and our TCP engine, then send what it has."
+  (let ((tc (conn-tcp c)))
+    (when (conn-outq c)
+      (dolist (b (conn-outq c)) (tcp:tcp-write tc b))
+      (setf (conn-outq c) '()))
+    (when (and (conn-fin-queued c) (not (conn-fin-sent c)))
+      (tcp:tcp-close tc) (setf (conn-fin-sent c) t))
+    (multiple-value-bind (segs events) (tcp:tcp-output tc now)
+      (dolist (seg segs) (%send-shim c seg))
+      (%tcp-events c events))))
+
+(defun %send-shim (c seg)
+  (handler-case
+      (d:daemon-send (endpoint-daemon (conn-ep c)) (or (conn-peer-key c) (conn-peer c))
+                     (cl-fips:ipv6-shim-wrap seg)
+                     :src-port cl-fips:+fsp-port-ipv6-shim+ :dst-port cl-fips:+fsp-port-ipv6-shim+)
+    (error () nil)))
+
+(defun %tcp-events (c events)
+  (let ((tc (conn-tcp c)))
+    (dolist (e events)
+      (case e
+        (:established (setf (conn-state c) :open))
+        (:data (let ((bytes (tcp:tcp-read tc)))
+                 (when (plusp (length bytes)) (setf (conn-inbox c) (append (conn-inbox c) (list bytes))))))
+        (:eof (setf (conn-eof c) t))
+        (:reset (%fail c (if (eq (conn-state c) :connecting) "connection refused or unanswered"
+                             "connection reset")))
+        (:closed (setf (conn-eof c) t (conn-state c) :closed))))
+    (when events (%wake c))))
+
+(defun %on-shim (ep peer shim)
+  "A shim packet from PEER: a TCP segment for one of our connections, if it names one."
+  (multiple-value-bind (seg next) (cl-fips:ipv6-shim-unwrap shim)
+    (when (and seg (= next 6) (>= (length seg) 4))
+      (let* ((sport (logior (ash (aref seg 0) 8) (aref seg 1)))
+             (dport (logior (ash (aref seg 2) 8) (aref seg 3)))
+             (c (gethash (%key peer (list :tcp dport sport)) (endpoint-conns ep))))
+        (when c
+          (%tcp-events c (tcp:tcp-input (conn-tcp c) seg (now-ms ep))))))))
+
 (defun %pump-conn (c now)
+  (when (conn-tcp c) (return-from %pump-conn (%pump-tcp c now)))
   (let ((ep (conn-ep c)))
     (declare (ignore ep))
     ;; control frames queued by the caller's thread
@@ -301,8 +346,11 @@
           (d:make-daemon config :log log
                                 :on-event (lambda (dmn ev)
                                             (declare (ignore dmn))
-                                            (when (and (eq (first ev) :data) (= (fourth ev) +stream-port+))
-                                              (%on-frame ep (second ev) (fifth ev)))))
+                                            (when (eq (first ev) :data)
+                                              (cond ((= (fourth ev) +stream-port+)
+                                                     (%on-frame ep (second ev) (fifth ev)))
+                                                    ((= (fourth ev) cl-fips:+fsp-port-ipv6-shim+)
+                                                     (%on-shim ep (second ev) (fifth ev)))))))
           (endpoint-gateway-key ep) (and gateway (cl-fips:npub-decode gateway))
           (endpoint-allow ep) (if (eq allow :any) :any
                                   (mapcar (lambda (n) (cl-fips:node-addr (cl-fips:npub-decode n))) allow)))
@@ -412,9 +460,42 @@
         (unless (member (conn-state c) '(:failed :closed)) (setf (conn-fin-queued c) t)))))
   t)
 
+(defun %fips-host-key (host)
+  "The key a <npub>.fips host name names, or NIL."
+  (let ((n (length host)))
+    (when (and (> n 5) (string-equal ".fips" host :start2 (- n 5)))
+      (ignore-errors (cl-fips:npub-decode (subseq host 0 (- n 5)))))))
+
+(defun %dial-fips-tcp (ep key port timeout)
+  "A TCP connection to PORT on the FIPS node KEY, through the IPv6 shim: our TCP
+   engine at one end, the node's own TCP stack at the other."
+  (let* ((daemon (endpoint-daemon ep))
+         (own (cl-fips:fips-node-own (d:daemon-node daemon)))
+         (peer (cl-fips:node-addr key))
+         (lport (+ 49152 (mod (cl-fips:decode-u32le (natrium:random-bytes 4) 0) 16384)))
+         (c (make-conn :ep ep :peer peer :id (list :tcp lport port)
+                       :peer-key (cl-fips:npub-encode key)))
+         (s (make-instance 'fips-stream :conn c :timeout-ms (* 1000 (or timeout 60)))))
+    (bt:with-lock-held ((endpoint-lock ep))
+      (multiple-value-bind (tc syns)
+          (tcp:tcp-open (cl-fips:fips-address own) (cl-fips:fips-address peer) lport port (now-ms ep)
+                        :iss (cl-fips:decode-u32le (natrium:random-bytes 4) 0)
+                        ;; a full segment fits one DataPacket on a UDP link: 1280 - 110
+                        ;; bytes of FIPS framing - 7 of shim - 20 of TCP header
+                        :mss 1100)
+        (setf (conn-tcp c) tc
+              (gethash (%key peer (conn-id c)) (endpoint-conns ep)) c)
+        (dolist (seg syns) (%send-shim c seg)))
+      (%await s (lambda (c) (eq (conn-state c) :open))))
+    (values s (lambda () (close s)))))
+
 (defun fips-dial (host port timeout)
   "cl-transport's :FIPS backend: a stream to HOST:PORT through the client's gateway.
    Returns (values stream closer)."
+  (let ((key (%fips-host-key host)))
+    (when key
+      (return-from fips-dial
+        (%dial-fips-tcp (or *fips-client* (error "fips: start-fips-client first")) key port timeout))))
   (let* ((ep (or *fips-client* (error "fips: start-fips-client first")))
          (gw (or (endpoint-gateway-key ep) (error "fips: no gateway configured")))
          (peer (cl-fips:node-addr gw))

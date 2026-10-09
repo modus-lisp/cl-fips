@@ -64,6 +64,7 @@
            #:fmp-seal-frame #:fmp-open-frame #:fmp-frame-payload-len-ok-p
            ;; identity (identity.lisp)
            #:node-addr #:fips-address #:fips-address-string
+           #:ipv6-shim-wrap #:ipv6-shim-unwrap #:+fsp-port-ipv6-shim+
            #:bech32-encode #:bech32-decode #:npub-encode #:npub-decode #:nsec-encode #:nsec-decode
            ;; FMP link rekey (rekey.lisp)
            #:+drain-window-secs+ #:+rekey-dampening-secs+ #:+rekey-jitter-secs+

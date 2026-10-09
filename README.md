@@ -106,8 +106,18 @@ gateway node → example.com. It fetches `https://example.com/` (577 bytes in ab
 to end, so the relay and the gateway see only ciphertext. A gateway opens TCP
 connections only for the npubs it is given.
 
-Not yet: tests of the stream protocol under loss (it resends, but only loopback
-has exercised it), and a stream service other than the TCP gateway.
+### Any FIPS node's own TCP: `http://<npub>.fips/`
+
+A host named `<npub>.fips` needs no gateway. `:fips` dials it the way upstream's TUN
+would carry it: TCP segments from `cl-transport/tcp`, a pure TCP engine, inside
+IPv6 shim packets (port 256). Upstream rebuilds them into IPv6 at the far node,
+whose own kernel TCP answers. `test/fetch-fips-url.lisp` peers with the public
+test mesh (`test-us01.fips.network`) and fetches
+`http://npub1crpldvy49ef8z34wlacwujnfudy4nd7k96aqdx5wgn6ckztz7z8q9t59ud.fips/`:
+HTTP 200, 141 KB in about 770 ms, with no TUN, no root and no Rust on our side.
+
+Not yet: tests of either stream path under loss (both resend, but only loopback
+and the live mesh have exercised them), and IPv6 for anything but TCP.
 
 ## Layout
 
@@ -124,6 +134,7 @@ has exercised it), and a stream service other than the TCP gateway.
 | `src/tree.lisp` | Our spanning-tree declaration, from the peers' verified announces |
 | `src/fsp.lisp` | The end-to-end session: SessionDatagram, the XK handshake bodies, DataPacket frames, rekey, drain |
 | `src/lookup.lisp` | Coordinate discovery: LookupRequest / LookupResponse codecs and the signed proof |
+| `src/ipv6-shim.lisp` | The IPv6 shim: IPv6 packets in DataPackets on port 256 |
 | `src/route.lisp` | Transit forwarding: TTL and path MTU for a SessionDatagram, the next hop from peers' filters, split horizon |
 | `src/node.lisp` | The node a program runs: its links, one shared tree, the FSP sessions it opens and accepts, and forwarding. Time is passed in, input is handed to it, and it returns events |
 | `src/identity.lisp` | `node_addr` and the FIPS IPv6 address |
