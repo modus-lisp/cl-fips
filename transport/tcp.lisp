@@ -15,7 +15,7 @@
 (defpackage #:cl-fips.transport
   (:use #:common-lisp)
   (:export #:tcp-connect #:tcp-listen #:tcp-listener-port #:tcp-accept #:tcp-listener-close
-           #:socket-byte-port
+           #:socket-byte-port #:tcp-socket-buffered-p #:udp-endpoint-socket
            #:+udp-mtu+ #:udp-open #:udp-close #:udp-endpoint-local-port #:udp-pump
            #:udp-peer-port #:udp-accept #:udp-port-ready-p #:udp-accept-pending-p
            #:udp-endpoint-received #:udp-endpoint-dropped))
@@ -43,7 +43,7 @@
                            (take)
                            (let ((wait (%seconds-until deadline)))
                              (when (and wait (<= wait 0)) (done :timeout))
-                             (if (usocket:wait-for-input socket :timeout wait :ready-only t)
+                             (if (usocket:wait-for-input (list socket) :timeout wait :ready-only t)
                                  (take)          ; readable: a byte, or EOF -- never blocks
                                  (done :timeout)))))
                    (error () (done :eof))))))
@@ -54,8 +54,15 @@
       (cl-fips:make-byte-port #'read-exactly #'write-all #'close-it))))
 
 (defun tcp-connect (host port &key (timeout-secs 10))
-  (socket-byte-port (usocket:socket-connect host port :element-type '(unsigned-byte 8)
-                                                      :timeout timeout-secs :nodelay t)))
+  "A BYTE-PORT on a new connection to HOST:PORT.  The second value is the socket."
+  (let ((socket (usocket:socket-connect host port :element-type '(unsigned-byte 8)
+                                                  :timeout timeout-secs :nodelay t)))
+    (values (socket-byte-port socket) socket)))
+
+(defun tcp-socket-buffered-p (socket)
+  "True if bytes are already inside SOCKET's Lisp stream.  WAIT-FOR-INPUT watches the
+   descriptor, so it cannot see these: an event loop must drain them first."
+  (ignore-errors (listen (usocket:socket-stream socket))))
 
 (defun tcp-listen (&key (host "127.0.0.1") (port 0))
   "Listen on HOST (loopback by default) and PORT (0 = ephemeral)."
@@ -64,9 +71,11 @@
 (defun tcp-listener-port (listener) (usocket:get-local-port listener))
 
 (defun tcp-accept (listener &key timeout-ms)
-  "Accept one connection as a BYTE-PORT, or NIL if TIMEOUT-MS passes first."
-  (when (usocket:wait-for-input listener :timeout (and timeout-ms (/ timeout-ms 1000d0))
+  "Accept one connection as a BYTE-PORT, or NIL if TIMEOUT-MS passes first.  The
+   second value is the socket."
+  (when (usocket:wait-for-input (list listener) :timeout (and timeout-ms (/ timeout-ms 1000d0))
                                          :ready-only t)
-    (socket-byte-port (usocket:socket-accept listener :element-type '(unsigned-byte 8)))))
+    (let ((socket (usocket:socket-accept listener :element-type '(unsigned-byte 8))))
+      (values (socket-byte-port socket) socket))))
 
 (defun tcp-listener-close (listener) (ignore-errors (usocket:socket-close listener)))

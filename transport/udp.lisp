@@ -85,11 +85,11 @@
   (if (udp-endpoint-closed ep)
       0
       (let ((n 0))
-        (when (usocket:wait-for-input (udp-endpoint-socket ep)
+        (when (usocket:wait-for-input (list (udp-endpoint-socket ep))
                                       :timeout (/ (max 0 timeout-ms) 1000d0) :ready-only t)
           (loop while (and (%receive-one ep)
                            (progn (incf n) t)
-                           (usocket:wait-for-input (udp-endpoint-socket ep)
+                           (usocket:wait-for-input (list (udp-endpoint-socket ep))
                                                    :timeout 0 :ready-only t))))
         n)))
 

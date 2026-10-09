@@ -1,0 +1,24 @@
+#!/bin/sh
+# cl-fips-node -- run a FIPS node on SBCL.
+#
+#   scripts/cl-fips-node keygen FILE     write a new identity (nsec, mode 0600) and FILE.pub
+#   scripts/cl-fips-node npub FILE       print the npub of the identity in FILE
+#   scripts/cl-fips-node run CONFIG      run the node CONFIG describes (see README)
+#
+# Needs SBCL, Quicklisp's usocket, and natrium and secp256k1-fast at
+# $NATRIUM_DIR / $SECP256K1_DIR (default ~/natrium, ~/secp256k1-fast).
+HERE=$(cd "$(dirname "$0")/.." && pwd)
+exec sbcl --noinform --non-interactive --no-userinit \
+  --eval '(require :asdf)' \
+  --eval "(push #p\"$HERE/\" asdf:*central-registry*)" \
+  --eval "(push #p\"${NATRIUM_DIR:-$HOME/natrium}/\" asdf:*central-registry*)" \
+  --eval "(push #p\"${SECP256K1_DIR:-$HOME/secp256k1-fast}/\" asdf:*central-registry*)" \
+  --eval '(let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
+            (when (probe-file ql) (load ql)))' \
+  --eval '(let ((*standard-output* (make-broadcast-stream)))
+            (if (find-package "QL")
+                (funcall (find-symbol "QUICKLOAD" "QL") "usocket" :silent t)
+                (asdf:load-system "usocket"))
+            (asdf:load-system "cl-fips/daemon"))' \
+  --eval '(cl-fips.daemon:main (rest (member "cl-fips-node" sb-ext:*posix-argv* :test (function string=))))' \
+  --end-toplevel-options cl-fips-node "$@"

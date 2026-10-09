@@ -52,6 +52,12 @@
            #:node-our-coords #:node-peer-coords
            #:node-open-session #:node-send-data #:node-start-rekey
            #:node-tick #:node-receive
+           #:node-lookup #:node-cached-coords #:node-tree-peer-p
+           #:make-lookup-request #:make-lookup-response #:encode-lookup-request #:decode-lookup-request
+           #:encode-lookup-response #:decode-lookup-response #:sign-lookup-proof #:verify-lookup-response
+           #:lookup-request-request-id #:lookup-request-ttl #:lookup-response-target-coords
+           #:lookup-response-path-mtu #:lookup-response-proof
+           #:+lookup-request-msg-type+ #:+lookup-response-msg-type+
            #:fips-make-xk-initiator #:fips-make-xk-responder
            ;; FMP established frames (fmp.lisp)
            #:+flag-key-epoch+ #:+flag-ce+ #:+flag-sp+ #:+inner-header-size+

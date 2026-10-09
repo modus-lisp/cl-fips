@@ -27,6 +27,7 @@
                              (:file "tree")
                              (:file "fsp")
                              (:file "route")
+                             (:file "lookup")
                              (:file "link")
                              (:file "node"))))
   :in-order-to ((test-op (test-op "cl-fips/test"))))
@@ -44,6 +45,7 @@
                              (:file "fsp-test")
                              (:file "transit-test")
                              (:file "node-test")
+                             (:file "lookup-test")
                              (:file "link-test"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-fips.test '#:run-all)))
 
@@ -54,7 +56,12 @@
   :depends-on ("cl-fips" "usocket")
   :components ((:module "transport" :serial t :components ((:file "tcp") (:file "udp")))))
 
+(defsystem "cl-fips/daemon"
+  :description "A runnable FIPS node on SBCL: config, identity file, UDP and TCP listeners, peers."
+  :depends-on ("cl-fips/transport" (:require "sb-posix"))
+  :components ((:module "transport" :components ((:file "daemon")))))
+
 (defsystem "cl-fips/transport-test"
   :description "FMP over real TCP against the upstream Rust oracle."
-  :depends-on ("cl-fips/test" "cl-fips/transport")
-  :components ((:module "test" :serial t :components ((:file "tcp-test") (:file "udp-test")))))
+  :depends-on ("cl-fips/test" "cl-fips/transport" "cl-fips/daemon")
+  :components ((:module "test" :serial t :components ((:file "tcp-test") (:file "udp-test") (:file "daemon-test")))))
