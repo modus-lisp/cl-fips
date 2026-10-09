@@ -111,10 +111,10 @@ not only against our own oracle. See [Real-node results](#real-node-results).
 
 ## Dependencies
 
-- **natrium** (branch `fips-noise`): SHA-256, HKDF, ChaCha20-Poly1305, the
+- **natrium** (master, 0af850a or later): SHA-256, HKDF, ChaCha20-Poly1305, the
   CSPRNG, and `natrium.noise` (generic Noise IK and XK with a replay window).
   No curve dependency.
-- **secp256k1-fast** (branch `fips-noise`): point arithmetic, the constant-time
+- **secp256k1-fast** (master, ad0705d or later): point arithmetic, the constant-time
   variable-base multiply used by the DH, and the FIPS ECDH and SEC1 codec.
   No dependencies.
 - **usocket**: the TCP adapter only. The protocol code does not use it.
@@ -237,8 +237,9 @@ For SBCL on Linux:
 - [x] A second independent review (FSP, MMP, the transports, lookup, the daemon).
       Its eleven findings are fixed, each with a regression test
       (`test/review-test.lisp`, `test/daemon-test.lisp` D6-D9)
-- [ ] Merge the `fips-noise` branches of natrium and secp256k1-fast, document
-      the API, and tag
+- [x] Merge the `fips-noise` branches of natrium and secp256k1-fast (both on
+      master now); the API is documented in `docs/API.md`
+- [ ] Tag 1.0
 
 ## Interop and the oracle
 
