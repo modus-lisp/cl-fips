@@ -21,6 +21,7 @@
                              (:file "fmp")
                              (:file "identity")
                              (:file "rekey")
+                             (:file "mmp")
                              (:file "link"))))
   :in-order-to ((test-op (test-op "cl-fips/test"))))
 
@@ -32,6 +33,7 @@
                 :components ((:file "test") (:file "noise-test") (:file "frame-test")
                              (:file "try-read-test")
                              (:file "rekey-test")
+                             (:file "mmp-test")
                              (:file "link-test"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-fips.test '#:run-all)))
 

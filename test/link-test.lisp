@@ -155,8 +155,10 @@
             (check "link: a frame for another index is dropped"
                    (eq (reason-of (lambda () (stream-link-receive link))) :wrong-receiver-index))
             (funcall deliver (octets 1 0 110 0 (filler 110)))
-            (check "link: a msg1 on an established link is :unexpected-phase"
-                   (eq (reason-of (lambda () (stream-link-receive link))) :unexpected-phase))
+            ;; a msg1 on an established link now goes to the rekey responder
+            ;; (rekey.lisp); garbage Noise there is dropped, not fatal
+            (check "link: a garbage msg1 on an established link is dropped as :bad-msg1"
+                   (eq (reason-of (lambda () (stream-link-receive link))) :bad-msg1))
             (check "link: the drops left the port open" (not (byte-port-closed port)))
             (funcall deliver good)
             (multiple-value-bind (m ts flags) (stream-link-receive link)

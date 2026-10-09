@@ -121,11 +121,31 @@
     (link-fail port :write-failed "peer stopped accepting bytes")))
 
 ;;; --- The link state machine -------------------------------------------------------
+;;;
+;;; After the handshake a STREAM-LINK is a shell around two pure machines: an
+;;; FMP-LINK (rekey.lisp: current / previous / pending sessions, the K bit, the
+;;; rekey decision and its msg1/msg2 packets) and an MMP-PEER (mmp.lisp: the
+;;; receiver and sender report state).  The shell owns the port and the clock;
+;;; every entry point takes an optional NOW-MS (milliseconds since the link was
+;;; established) so tests can drive time, and reads the clock when it is absent.
+;;;
+;;; Rekey packets on the established stream (upstream src/transport/framing.rs
+;;; read_fmp_packet accepts phases 0x1 and 0x2 on any connection; node/handlers/
+;;; handshake.rs routes a msg1 from an established peer to the rekey responder
+;;; and a msg2 naming our in-flight rekey index to complete_rekey_msg2):
+;;;   msg1 from the peer -> LINK-RECEIVE answers it; the msg2 is written here.
+;;;   msg2 for our rekey -> held pending; the next STREAM-LINK-POLL cuts over.
+;;;   a frame that authenticates on the pending session (K flipped) -> adopted.
+;;; Both promotions reset the MMP receiver, as peer/active.rs (1401, 1447) does.
 
 (defstruct (stream-link (:constructor %make-stream-link))
-  port role session our-index their-index handshake-hash
-  remote-static remote-epoch (mtu +default-stream-mtu+) timeout-ms (started 0)
-  (state :established))
+  port role fmp mmp handshake-hash remote-static remote-epoch
+  (mtu +default-stream-mtu+) timeout-ms (started 0) (state :established))
+
+(defun stream-link-session (link) (link-session (stream-link-fmp link)))
+(defun stream-link-our-index (link) (link-our-index (stream-link-fmp link)))
+(defun stream-link-their-index (link) (link-their-index (stream-link-fmp link)))
+(defun stream-link-k-bit (link) (link-k-bit (stream-link-fmp link)))
 
 (defun random-session-index ()
   (decode-u32le (natrium:random-bytes 4)))
@@ -143,19 +163,35 @@
      (natrium.noise:noise-error (e)
        (link-fail ,port ,reason (natrium.noise:noise-error-reason e) ,fatal))))
 
-(defun %finish-link (port role hs our their mtu timeout-ms)
-  (%make-stream-link
-   :port port :role role :our-index our :their-index their
-   :handshake-hash (natrium.noise:handshake-hash hs)
-   :remote-static (secp256k1-fast.ecdh:encode-pubkey (natrium.noise:hs-remote-static hs))
-   :remote-epoch (natrium.noise:hs-remote-epoch hs)
-   :session (natrium.noise:handshake-into-session hs)
-   :mtu mtu :timeout-ms timeout-ms :started (get-internal-real-time)))
+(defun %make-mmp (reports)
+  "REPORTS: T (SenderReport and ReceiverReport), :NO-RR (SenderReport only),
+   :RR-ONLY, or NIL (no reports)."
+  (make-mmp-peer :send-rr (and (member reports '(t :rr-only)) t)
+                 :send-sr (and (member reports '(t :no-rr)) t)))
+
+(defun %finish-link (port role hs our their mtu timeout-ms static local-epoch
+                     rekey-config jitter-fn reports)
+  (let* ((hash (natrium.noise:handshake-hash hs))
+         (remote (secp256k1-fast.ecdh:encode-pubkey (natrium.noise:hs-remote-static hs)))
+         (epoch (natrium.noise:hs-remote-epoch hs))
+         (session (natrium.noise:handshake-into-session hs)))
+    (%make-stream-link
+     :port port :role role :handshake-hash hash :remote-static remote :remote-epoch epoch
+     :fmp (make-link session our their :static static :peer-static-bytes remote
+                                       :local-epoch local-epoch :remote-epoch epoch :now-ms 0
+                                       :allocate-index #'random-session-index
+                                       :config (or rekey-config (make-rekey-config))
+                                       :jitter-fn (or jitter-fn (constantly 0)))
+     :mmp (%make-mmp reports)
+     :mtu mtu :timeout-ms timeout-ms :started (get-internal-real-time))))
 
 (defun stream-link-initiate (port static remote-static-bytes local-epoch
                              &key (our-index (random-session-index))
-                               (mtu +default-stream-mtu+) timeout-ms)
-  "IK initiator on PORT: write msg1, read msg2.  Returns an established STREAM-LINK."
+                               (mtu +default-stream-mtu+) timeout-ms
+                               rekey-config jitter-fn (reports t))
+  "IK initiator on PORT: write msg1, read msg2.  Returns an established STREAM-LINK.
+   REKEY-CONFIG / JITTER-FN configure the rekey machine (stock: 120 s, no
+   jitter); REPORTS selects the MMP reports STREAM-LINK-POLL emits."
   (let* ((hs (fips-make-ik-initiator static remote-static-bytes local-epoch)))
     (write-fmp-packet port (build-msg1 our-index (natrium.noise:ik-write-message-1 hs)))
     (let ((packet (%handshake-packet port +phase-msg2+ mtu timeout-ms)))
@@ -166,11 +202,13 @@
                      (format nil "msg2 names index ~d, ours is ~d" receiver-index our-index)))
         (%noise-or-fail (port :handshake-failed)
           (natrium.noise:ik-read-message-2 hs noise-msg2))
-        (%finish-link port :initiator hs our-index their-index mtu timeout-ms)))))
+        (%finish-link port :initiator hs our-index their-index mtu timeout-ms
+                      static local-epoch rekey-config jitter-fn reports)))))
 
 (defun stream-link-accept (port static local-epoch
                            &key (our-index (random-session-index))
-                             (mtu +default-stream-mtu+) timeout-ms)
+                             (mtu +default-stream-mtu+) timeout-ms
+                             rekey-config jitter-fn (reports t))
   "IK responder on PORT: read msg1, write msg2.  Returns an established STREAM-LINK."
   (let* ((hs (fips-make-ik-responder static local-epoch))
          (packet (%handshake-packet port +phase-msg1+ mtu timeout-ms)))
@@ -180,45 +218,92 @@
         (natrium.noise:ik-read-message-1 hs noise-msg1))
       (let ((noise-msg2 (natrium.noise:ik-write-message-2 hs)))
         (write-fmp-packet port (build-msg2 our-index their-index noise-msg2))
-        (%finish-link port :responder hs our-index their-index mtu timeout-ms)))))
+        (%finish-link port :responder hs our-index their-index mtu timeout-ms
+                      static local-epoch rekey-config jitter-fn reports)))))
 
 (defun stream-link-elapsed-ms (link)
   (floor (* 1000 (- (get-internal-real-time) (stream-link-started link)))
          internal-time-units-per-second))
 
-(defun stream-link-send (link link-message &key (flags 0) timestamp-ms)
-  "Seal LINK-MESSAGE ([msg_type][body]) to the peer's index and write it."
-  (let ((wire (fmp-seal-frame (stream-link-session link) (stream-link-their-index link)
-                              (ldb (byte 32 0) (or timestamp-ms (stream-link-elapsed-ms link)))
-                              link-message :flags flags)))
+(defun %session-ms (link now)
+  "Session-relative ms on the CURRENT session (node/mod.rs: the frame timestamp,
+   and peer.session_elapsed_ms() that a timestamp echo is measured against)."
+  (ldb (byte 32 0) (- now (link-session-start (stream-link-fmp link)))))
+
+(defun stream-link-send (link link-message &key (flags 0) timestamp-ms now-ms)
+  "Seal LINK-MESSAGE ([msg_type][body]) on the current session, to the peer's
+   current index, with our K bit, and write it.  Counts it for SenderReports."
+  (let* ((now (or now-ms (stream-link-elapsed-ms link)))
+         (fmp (stream-link-fmp link))
+         (session (link-session fmp))
+         (counter (natrium.noise:session-current-send-counter session))
+         (ts (ldb (byte 32 0) (or timestamp-ms (%session-ms link now))))
+         (wire (fmp-seal-frame session (link-their-index fmp) ts link-message
+                               :flags (if (link-k-bit fmp) (logior flags +flag-key-epoch+) flags))))
     (when (> (length wire) (stream-link-mtu link))
       (error 'link-error :reason :mtu-exceeded :fatal nil
                          :detail (format nil "~d-byte packet over MTU ~d"
                                          (length wire) (stream-link-mtu link))))
     (write-fmp-packet (stream-link-port link) wire)
+    (mmp-sender-record (mmp-sender (stream-link-mmp link)) counter ts (length wire))
     wire))
 
-(defun stream-link-receive (link &key (timeout-ms (stream-link-timeout-ms link)))
-  "Read the next packet.  An established frame for our index that opens returns
-   (values link-message timestamp-ms flags counter).  Framing failures are fatal
-   and close the port; a frame that does not open, names another index, or a
-   handshake packet on an established link (rekey is not wired to the stream
-   yet) is a NON-fatal LINK-ERROR: the frame is dropped and the link stays up."
+(defun %drop-reason (reason)
+  "rekey.lisp's drop reasons, in this file's historic vocabulary where one exists."
+  (case reason
+    ((:decrypt-failed :inner-header-too-short :malformed) :frame-rejected)
+    (:unknown-index :wrong-receiver-index)
+    (t reason)))
+
+(defun stream-link-receive (link &key (timeout-ms (stream-link-timeout-ms link)) now-ms)
+  "Read and handle the next packet.
+   An established frame that authenticates returns
+     (values link-message timestamp-ms flags counter slot)
+   with SLOT :current, :previous (the drain) or :adopted (the peer's first frame
+   on a rekeyed session; the keys rotated here).  Frames on the current session
+   feed the MMP receiver; incoming SenderReports / ReceiverReports are decoded
+   into the MMP state (and still returned).
+   A rekey packet returns (values NIL EVENT): :rekey-answered (a msg1 from the
+   peer was answered with a msg2, written here) or :rekey-complete (the msg2 for
+   our rekey; the next STREAM-LINK-POLL cuts over).
+   Framing failures are fatal and close the port.  Everything upstream drops --
+   a frame that does not open (:frame-rejected), names an index we do not hold
+   (:wrong-receiver-index), a msg1 that is not a rekey -- is a NON-fatal
+   LINK-ERROR whose reason is the drop reason; the link stays up."
   (let* ((port (stream-link-port link))
-         (wire (read-fmp-packet port :mtu (stream-link-mtu link) :timeout-ms timeout-ms)))
-    (unless (= (prefix-phase wire) +phase-established+)
-      (link-fail port :unexpected-phase
-                 (format nil "phase 0x~x on an established link" (prefix-phase wire)) nil))
-    (let ((idx (decode-u32le wire 4)))
-      (unless (= idx (stream-link-our-index link))
-        (link-fail port :wrong-receiver-index
-                   (format nil "frame for index ~d, ours is ~d" idx (stream-link-our-index link))
-                   nil)))
-    (multiple-value-bind (msg ts flags idx counter)
-        (%noise-or-fail (port :frame-rejected nil)
-          (fmp-open-frame (stream-link-session link) wire))
-      (declare (ignore idx))
-      (values msg ts flags counter))))
+         (wire (read-fmp-packet port :mtu (stream-link-mtu link) :timeout-ms timeout-ms))
+         (now (or now-ms (stream-link-elapsed-ms link)))
+         (mmp (stream-link-mmp link)))
+    (multiple-value-bind (kind a b c d e) (link-receive (stream-link-fmp link) wire now)
+      (ecase kind
+        (:frame
+         (let ((msg a) (slot b) (flags c) (ts d) (counter e))
+           (when (eq slot :adopted) (mmp-reset-for-rekey mmp now))
+           (unless (eq slot :previous)
+             (mmp-receiver-record (mmp-receiver mmp) counter ts (length wire)
+                                  (logtest flags +flag-ce+) now))
+           (mmp-handle-report mmp msg (%session-ms link now))
+           (values msg ts flags counter slot)))
+        (:msg2 (write-fmp-packet port a) (values nil :rekey-answered))
+        (:rekey-complete (values nil :rekey-complete))
+        (:drop (link-fail port (%drop-reason a)
+                          (format nil "phase 0x~x packet dropped: ~(~a~)" (prefix-phase wire) a)
+                          nil))))))
+
+(defun stream-link-poll (link &key now-ms)
+  "The periodic tick: the rekey decision (cutover, drain, retire, initiate --
+   a msg1 is written here), then any MMP report that is due.  Returns
+   (values rekey-actions report-msg-types)."
+  (let* ((now (or now-ms (stream-link-elapsed-ms link)))
+         (mmp (stream-link-mmp link))
+         (sent '()))
+    (multiple-value-bind (packets actions) (link-tick (stream-link-fmp link) now)
+      (when (member :cutover actions) (mmp-reset-for-rekey mmp now))
+      (dolist (p packets) (write-fmp-packet (stream-link-port link) p))
+      (dolist (m (mmp-due-reports mmp now))
+        (stream-link-send link m :now-ms now)
+        (push (aref m 0) sent))
+      (values actions (nreverse sent)))))
 
 (defun stream-link-close (link)
   (byte-port-close (stream-link-port link)))

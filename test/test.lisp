@@ -88,6 +88,7 @@
   (test-identity)                       ; frame-test.lisp
   (test-try-read)                       ; try-read-test.lisp
   (test-rekey)                          ; rekey-test.lisp
+  (test-mmp)                            ; mmp-test.lisp
   (test-link-local)                     ; link-test.lisp
   (if *tcp-suite*
       (funcall *tcp-suite*)             ; tcp-test.lisp

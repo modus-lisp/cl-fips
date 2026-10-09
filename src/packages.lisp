@@ -40,7 +40,33 @@
            #:stream-link-port #:stream-link-role #:stream-link-session
            #:stream-link-our-index #:stream-link-their-index #:stream-link-handshake-hash
            #:stream-link-remote-static #:stream-link-remote-epoch #:stream-link-mtu
-           #:random-session-index #:make-octet-source-port))
+           #:random-session-index #:make-octet-source-port
+           #:stream-link-poll #:stream-link-fmp #:stream-link-mmp #:stream-link-k-bit
+           #:stream-link-elapsed-ms
+           ;; MMP link reports (mmp.lisp)
+           #:+msg-type-sender-report+ #:+msg-type-receiver-report+
+           #:+sender-report-size+ #:+receiver-report-size+
+           #:sender-report #:make-sender-report #:receiver-report #:make-receiver-report
+           #:encode-sender-report #:decode-sender-report
+           #:encode-receiver-report #:decode-receiver-report
+           #:mmp-peer #:make-mmp-peer #:mmp-receiver #:mmp-sender #:mmp-metrics
+           #:mmp-send-rr #:mmp-send-sr
+           #:make-mmp-receiver #:mmp-receiver-record #:mmp-receiver-due-p
+           #:mmp-receiver-build-report #:mmp-receiver-reset-for-rekey
+           #:make-mmp-sender #:mmp-sender-record #:mmp-sender-due-p #:mmp-sender-build-report
+           #:make-mmp-metrics #:mmp-metrics-process-rr #:mmp-handle-report
+           #:mmp-due-reports #:mmp-reset-for-rekey
+           #:sender-report-interval-start-counter #:sender-report-interval-end-counter
+           #:sender-report-interval-start-timestamp
+           #:sender-report-interval-end-timestamp #:sender-report-interval-bytes-sent
+           #:sender-report-cumulative-packets-sent #:sender-report-cumulative-bytes-sent
+           #:receiver-report-highest-counter #:receiver-report-cumulative-packets-recv
+           #:receiver-report-cumulative-bytes-recv #:receiver-report-timestamp-echo
+           #:receiver-report-dwell-time #:receiver-report-max-burst-loss
+           #:receiver-report-mean-burst-loss #:receiver-report-jitter
+           #:receiver-report-ecn-ce-count #:receiver-report-owd-trend
+           #:receiver-report-burst-loss-count #:receiver-report-cumulative-reorder-count
+           #:receiver-report-interval-packets-recv #:receiver-report-interval-bytes-recv))
 
 (defpackage #:cl-fips.test
   (:use #:common-lisp #:cl-fips #:natrium.noise #:secp256k1-fast.ecdh)

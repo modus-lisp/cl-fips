@@ -379,7 +379,7 @@
         (setf pt (%open-on (link-previous-session link) counter ct header) slot :previous))
       (cond ((null pt) (values :drop :decrypt-failed))
             ((< (length pt) +inner-header-size+) (values :drop :inner-header-too-short))
-            (t (values :frame (subseq pt 4) slot flags (decode-u32le pt 0)))))))
+            (t (values :frame (subseq pt 4) slot flags (decode-u32le pt 0) counter))))))
 
 (defun %remote-identity-ok-p (link hs)
   (equalp (node-addr (secp256k1-fast.ecdh:encode-pubkey (natrium.noise:hs-remote-static hs)))
@@ -451,8 +451,9 @@
 
 (defun link-receive (link wire now-ms)
   "Dispatch one packet from the peer by phase.  Returns one of
-     (values :frame link-message slot flags timestamp)  slot = :current, :previous
-                                                        or :adopted (pending promoted)
+     (values :frame link-message slot flags timestamp counter)
+                                  slot = :current, :previous or :adopted (pending
+                                  promoted); counter = the frame's AEAD counter
      (values :msg2 wire)          send this answer to the peer
      (values :rekey-complete nil) msg2 read; the next tick cuts over
      (values :drop reason)        upstream drops it (silently, or with a log line)"

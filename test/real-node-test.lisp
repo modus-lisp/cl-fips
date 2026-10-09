@@ -12,9 +12,12 @@
 ;;;;                         dials it as a configured static peer
 ;;;;
 ;;;; dial/accept: complete the handshake, send a Heartbeat (msg_type 0x51, no
-;;;; body) every 5 s, and log every established frame the node sends by its
-;;;; inner msg_type until SECS pass.  Handshake packets arriving on the
-;;;; established link (the node's periodic rekey msg1) are logged and dropped.
+;;;; body) every 5 s, poll the link every ~200 ms (rekey decisions; MMP
+;;;; SenderReports and ReceiverReports when due), and log every established
+;;;; frame the node sends by its inner msg_type until SECS pass.  The node's
+;;;; rekey msg1 is answered on the stream and its new-epoch frames adopted; our
+;;;; own rekey (120 s) is initiated by the poll.  CL_FIPS_REPORTS=no-rr turns the
+;;;; ReceiverReports off (the negative control in run-real-node.sh).
 ;;;; Exit 0 when the handshake completed, the remote static key is the node's,
 ;;;; and at least one TreeAnnounce (0x10) and one Heartbeat (0x51) arrived.
 
@@ -89,24 +92,77 @@
     (with-open-file (o (format nil "~a/node.addr" dir) :direction :output :if-exists :supersede)
       (write-line (hex (cl-fips:node-addr (secp256k1-fast.ecdh:keypair-public-bytes node))) o))))
 
+(defun reports-mode ()
+  "CL_FIPS_REPORTS: unset or \"all\" = SenderReport + ReceiverReport (default),
+   \"no-rr\" = SenderReport only (the negative control), \"off\" = none."
+  (let ((v (sb-ext:posix-getenv "CL_FIPS_REPORTS")))
+    (cond ((or (null v) (string= v "") (string= v "all")) t)
+          ((string= v "no-rr") :no-rr)
+          ((string= v "off") nil)
+          (t (error "CL_FIPS_REPORTS must be all, no-rr or off, not ~s" v)))))
+
+(defvar *stats* nil)
+(defun bump (key) (incf (getf *stats* key 0)))
+
 (defun exchange (link sock secs)
-  "Heartbeat every 5 s; log each frame by msg_type.  Returns the msg_types seen."
-  (let* ((t0 (ms)) (deadline (+ t0 (* 1000 secs))) (next-hb 0) (seen '()))
+  "Heartbeat every 5 s; poll the link (rekey decisions, MMP reports) every
+   200 ms; log each frame by msg_type and each rekey event.  Returns the
+   msg_types seen."
+  (let* ((t0 (ms)) (deadline (+ t0 (* 1000 secs))) (next-hb 0) (seen '())
+         (last-frame-log 0))
     (loop while (< (ms) deadline) do
       (when (>= (ms) next-hb)
         (cl-fips:stream-link-send link (coerce #(#x51) '(vector (unsigned-byte 8))))
-        (out "~6d SENT msg_type=0x51 (Heartbeat)" (- (ms) t0))
+        (out "~6d SENT msg_type=0x51 (Heartbeat) k=~:[0~;1~]"
+             (- (ms) t0) (cl-fips:stream-link-k-bit link))
         (setf next-hb (+ (ms) 5000)))
+      (multiple-value-bind (actions reports) (cl-fips:stream-link-poll link)
+        (dolist (a actions)
+          (bump a)
+          (when (eq a :cutover) (setf (getf *stats* :frames-since-rotate) 0))
+          (out "~6d REKEY ~(~a~) our_index=~8,'0x their_index=~8,'0x k=~:[0~;1~]"
+               (- (ms) t0) a (cl-fips:stream-link-our-index link)
+               (cl-fips:stream-link-their-index link) (cl-fips:stream-link-k-bit link)))
+        (dolist (r reports)
+          (bump (if (= r 2) :rr-sent :sr-sent))))
       (when (or (listen (usocket:socket-stream sock))
-                (usocket:wait-for-input sock :timeout 1 :ready-only t))
+                (usocket:wait-for-input sock :timeout 0.2 :ready-only t))
         (handler-case
-            (multiple-value-bind (m ts flags counter) (cl-fips:stream-link-receive link :timeout-ms 10000)
-              (pushnew (aref m 0) seen)
-              (out "~6d RECV msg_type=0x~2,'0x len=~d ts=~d flags=~d counter=~d"
-                   (- (ms) t0) (aref m 0) (length m) ts flags counter))
+            (multiple-value-bind (m ts flags counter slot)
+                (cl-fips:stream-link-receive link :timeout-ms 10000)
+              (cond
+                ((null m)
+                 (bump ts)                 ; the event keyword
+                 (out "~6d REKEY ~(~a~) (rekey packet from the node) our_index=~8,'0x"
+                      (- (ms) t0) ts (cl-fips:stream-link-our-index link)))
+                (t
+                 (pushnew (aref m 0) seen)
+                 (bump :frames)
+                 (when (eq slot :adopted)
+                   (bump :adopted)
+                   (setf (getf *stats* :frames-since-rotate) 0)
+                   (out "~6d REKEY adopted: keys rotated our_index=~8,'0x their_index=~8,'0x k=~:[0~;1~]"
+                        (- (ms) t0) (cl-fips:stream-link-our-index link)
+                        (cl-fips:stream-link-their-index link) (cl-fips:stream-link-k-bit link)))
+                 (when (getf *stats* :frames-since-rotate) (bump :frames-since-rotate))
+                 ;; reports arrive every second: log one line per 10 s of them
+                 (when (or (not (member (aref m 0) '(1 2)))
+                           (>= (- (ms) last-frame-log) 10000))
+                   (when (member (aref m 0) '(1 2)) (setf last-frame-log (ms)))
+                   (out "~6d RECV msg_type=0x~2,'0x len=~d ts=~d flags=~d counter=~d slot=~(~a~)"
+                        (- (ms) t0) (aref m 0) (length m) ts flags counter slot)))))
           (cl-fips:link-error (e)
             (out "~6d LINK-ERROR ~a" (- (ms) t0) e)
             (when (cl-fips:link-error-fatal-p e) (return))))))
+    (let ((m (cl-fips::mmp-metrics (cl-fips:stream-link-mmp link))))
+      (out "MMP: sent ~d ReceiverReports, ~d SenderReports; node's RRs accepted ~d of ~d, RTT samples ~d, srtt ~,1f ms"
+           (getf *stats* :rr-sent 0) (getf *stats* :sr-sent 0)
+           (cl-fips::mm-reports-accepted m) (cl-fips::mm-reports-seen m)
+           (cl-fips::mm-rtt-samples m) (/ (cl-fips::mm-srtt-us m) 1000.0)))
+    (out "REKEY-SUMMARY answered=~d complete=~d cutover=~d adopted=~d frames-after-last-rotation=~a"
+         (getf *stats* :rekey-answered 0) (getf *stats* :rekey-complete 0)
+         (getf *stats* :cutover 0) (getf *stats* :adopted 0)
+         (getf *stats* :frames-since-rotate "n/a"))
     seen))
 
 (defun run-link (dir role port secs)
@@ -129,10 +185,12 @@
     (let ((port (cl-fips.transport:socket-byte-port sock)))
       (handler-case
           (setf link (if (eq role :accept)
-                         (cl-fips:stream-link-accept port static epoch :timeout-ms 10000)
+                         (cl-fips:stream-link-accept port static epoch :timeout-ms 10000
+                                                     :reports (reports-mode))
                          (cl-fips:stream-link-initiate port static (second node) epoch
-                                                       :timeout-ms 10000)))
+                                                       :timeout-ms 10000 :reports (reports-mode))))
         (error (e) (out "FAIL: handshake: ~a" e) (sb-ext:exit :code 1))))
+    (out "REPORTS mode=~(~a~)" (reports-mode))
     (out "HANDSHAKE OK role=~(~a~) our_index=~8,'0x their_index=~8,'0x remote_epoch=~a"
          role (cl-fips:stream-link-our-index link) (cl-fips:stream-link-their-index link)
          (hex (cl-fips:stream-link-remote-epoch link)))
