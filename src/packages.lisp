@@ -24,6 +24,14 @@
            #:tree-current-announce
            #:make-bloom #:bloom-bit-indices #:bloom-insert #:bloom-contains-p
            #:bloom-union #:encode-filter-announce #:decode-filter-announce
+           ;; end-to-end data plane (fsp.lisp)
+           #:encode-session-datagram #:decode-session-datagram
+           #:encode-coords #:decode-coords
+           #:encode-fsp-setup-or-ack #:decode-fsp-setup-or-ack
+           #:encode-fsp-msg3 #:decode-fsp-msg3
+           #:fsp-seal-data #:fsp-open-data
+           #:make-fsp-initiator #:fsp-initiator-phase #:fsp-initiator-session
+           #:fsp-setup-datagram #:fsp-handle-ack #:fsp-data-datagram #:fsp-initiator-our-addr
            #:fips-make-xk-initiator #:fips-make-xk-responder
            ;; FMP established frames (fmp.lisp)
            #:+flag-key-epoch+ #:+flag-ce+ #:+flag-sp+ #:+inner-header-size+
@@ -50,7 +58,7 @@
            #:fmp-packet-remaining #:read-fmp-packet #:write-fmp-packet #:deadline-after-ms
            #:stream-link #:stream-link-initiate #:stream-link-accept
            #:stream-link-send #:stream-link-receive #:stream-link-close
-           #:stream-link-port #:stream-link-role #:stream-link-session
+           #:stream-link-port #:stream-link-role #:stream-link-session #:stream-link-tree
            #:stream-link-our-index #:stream-link-their-index #:stream-link-handshake-hash
            #:stream-link-remote-static #:stream-link-remote-epoch #:stream-link-mtu
            #:random-session-index #:make-octet-source-port

@@ -110,18 +110,51 @@
 (defvar *stats* nil)
 (defun bump (key) (incf (getf *stats* key 0)))
 
-(defun exchange (link sock secs)
+(defun fsp-enabled-p ()
+  "CL_FIPS_FSP: unset or \"on\" = run an end-to-end FSP session through the node
+   (the default); \"off\" = none."
+  (not (equal (sb-ext:posix-getenv "CL_FIPS_FSP") "off")))
+
+(defun fsp-peer-coords (link node-addr)
+  "The node's ancestry from its verified TreeAnnounce, or NIL before one arrives."
+  (let* ((tree (cl-fips:stream-link-tree link))
+         (held (and tree (gethash node-addr (cl-fips::tree-state-peers tree)))))
+    (and held (mapcar #'cl-fips:coord-entry-node (cdr held)))))
+
+(defun exchange (link sock secs static node-pub)
   "Heartbeat every 5 s; poll the link (rekey decisions, MMP reports) every
    200 ms; log each frame by msg_type and each rekey event.  Returns the
    msg_types seen."
   (let* ((t0 (ms)) (deadline (+ t0 (* 1000 secs))) (next-hb 0) (seen '())
-         (last-frame-log 0))
+         (last-frame-log 0)
+         (fsp nil) (next-data 0) (data-count 0)
+         (node-addr (cl-fips:node-addr node-pub))
+         (our-addr (cl-fips:node-addr (secp256k1-fast.ecdh:keypair-public-bytes static))))
     (loop while (< (ms) deadline) do
       (when (>= (ms) next-hb)
         (cl-fips:stream-link-send link (coerce #(#x51) '(vector (unsigned-byte 8))))
         (out "~6d SENT msg_type=0x51 (Heartbeat) k=~:[0~;1~]"
              (- (ms) t0) (cl-fips:stream-link-k-bit link))
         (setf next-hb (+ (ms) 5000)))
+      ;; the end-to-end session: start once the node's ancestry is known
+      (when (and (fsp-enabled-p) (null fsp))
+        (let ((peer-coords (fsp-peer-coords link node-addr))
+              (tree (cl-fips:stream-link-tree link)))
+          (when (and peer-coords tree (cl-fips:tree-state-entries tree))
+            (setf fsp (cl-fips:make-fsp-initiator
+                       static node-pub (natrium:random-bytes 8) our-addr node-addr
+                       (mapcar #'cl-fips:coord-entry-node (cl-fips:tree-state-entries tree))
+                       peer-coords))
+            (let ((d (cl-fips:fsp-setup-datagram fsp)))
+              (cl-fips:stream-link-send link d)
+              (out "~6d FSP SessionSetup sent to the node (XK msg1)" (- (ms) t0))))))
+      (when (and fsp (eq (cl-fips:fsp-initiator-phase fsp) :established) (>= (ms) next-data))
+        (incf data-count)
+        (let ((d (cl-fips:fsp-data-datagram fsp (natrium:ascii->bytes (format nil "cl-fips probe ~d" data-count))
+                                            :timestamp-ms (ldb (byte 32 0) (- (ms) t0)))))
+          (cl-fips:stream-link-send link d)
+          (out "~6d FSP DataPacket ~d sent (dst_port 256)" (- (ms) t0) data-count))
+        (setf next-data (+ (ms) 5000)))
       (multiple-value-bind (actions reports) (cl-fips:stream-link-poll link)
         (dolist (a actions)
           (bump a)
@@ -141,6 +174,28 @@
                  (bump ts)                 ; the event keyword
                  (out "~6d REKEY ~(~a~) (rekey packet from the node) our_index=~8,'0x"
                       (- (ms) t0) ts (cl-fips:stream-link-our-index link)))
+                ((and (= (aref m 0) 0) fsp)
+                 ;; a SessionDatagram: the SessionAck during setup, then established
+                 ;; FSP frames from the node (its session reports, and any data)
+                 (pushnew (aref m 0) seen)
+                 (handler-case
+                     (let ((payload (nth-value 4 (cl-fips:decode-session-datagram (subseq m 1)))))
+                       (cond
+                         ((eq (cl-fips:fsp-initiator-phase fsp) :setup-sent)
+                          (let ((reply (cl-fips:fsp-handle-ack fsp (subseq m 1))))
+                            (cl-fips:stream-link-send link reply)
+                            (out "~6d FSP SessionAck received; SessionMsg3 sent; session established"
+                                 (- (ms) t0))))
+                         ((zerop (cl-fips:prefix-phase payload))
+                          (multiple-value-bind (mt sp dp data) (cl-fips:fsp-open-data
+                                                                (cl-fips:fsp-initiator-session fsp)
+                                                                payload)
+                            (declare (ignore sp dp data))
+                            (out "~6d FSP inbound established frame msg_type=0x~2,'0x len=~d"
+                                 (- (ms) t0) mt (length payload))))
+                         (t (out "~6d FSP phase ~d ignored" (- (ms) t0)
+                                 (cl-fips:prefix-phase payload)))))
+                   (error (e) (out "~6d FSP: ~a" (- (ms) t0) e))))
                 (t
                  (pushnew (aref m 0) seen)
                  (bump :frames)
@@ -201,7 +256,7 @@
          role (cl-fips:stream-link-our-index link) (cl-fips:stream-link-their-index link)
          (hex (cl-fips:stream-link-remote-epoch link)))
     (let* ((static-ok (equalp (cl-fips:stream-link-remote-static link) (second node)))
-           (seen (exchange link sock secs))
+           (seen (exchange link sock secs static (second node)))
            (ok (and static-ok (member #x10 seen) (member #x51 seen))))
       (cl-fips:stream-link-close link)
       (out "remote static is the node's key: ~:[NO~;yes~]" static-ok)

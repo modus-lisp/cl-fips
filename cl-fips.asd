@@ -25,6 +25,7 @@
                              (:file "stp")
                              (:file "bloom")
                              (:file "tree")
+                             (:file "fsp")
                              (:file "link"))))
   :in-order-to ((test-op (test-op "cl-fips/test"))))
 
@@ -38,6 +39,7 @@
                              (:file "rekey-test")
                              (:file "mmp-test")
                              (:file "routing-test")
+                             (:file "fsp-test")
                              (:file "link-test"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-fips.test '#:run-all)))
 

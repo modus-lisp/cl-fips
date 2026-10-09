@@ -89,6 +89,16 @@ check_node_log() {  # $1 arm, $2 log
   else
     if grep -q "Resending unconfirmed TreeAnnounce" "$2"; then echo "  (routing off: node resends TreeAnnounce as expected)"; fi
   fi
+  # End-to-end session (CL_FIPS_FSP, on by default): the node must establish the
+  # XK session as responder and decrypt our DataPackets (dst_port 256 is the IPv6
+  # shim; the shim rejects our non-IPv6 probe, which is logged after decryption).
+  if [ "${CL_FIPS_FSP:-on}" != "off" ]; then
+    if grep -q "Session established (responder, XK)" "$2"; then echo "  node: FSP session established (responder, XK)"
+    else echo "  FAIL: node did not establish an FSP session"; fail=1; fi
+    dp=$(grep -c "IPv6 shim decompression failed.*len=15" "$2")
+    if [ "$dp" -ge 1 ]; then echo "  node: decrypted and dispatched $dp DataPackets from Lisp (15-byte probes)"
+    else echo "  FAIL: node decrypted no DataPacket from Lisp"; fail=1; fi
+  fi
   if grep -qE "Removing peer|Peer removed" "$2"; then echo "  FAIL: node removed the peer"; fail=1
   else echo "  node: never removed the peer"; fi
   if grep -q "FMP rekey aborted" "$2"; then echo "  FAIL: node aborted an FMP rekey"; fail=1; fi

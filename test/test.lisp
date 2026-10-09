@@ -90,6 +90,7 @@
   (test-rekey)                          ; rekey-test.lisp
   (test-mmp)                            ; mmp-test.lisp
   (test-routing)                        ; routing-test.lisp
+  (test-fsp)                            ; fsp-test.lisp
   (test-link-local)                     ; link-test.lisp
   (if *tcp-suite*
       (funcall *tcp-suite*)             ; tcp-test.lisp
