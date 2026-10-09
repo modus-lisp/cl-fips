@@ -21,6 +21,9 @@
 (push (pathname (format nil "~a/" (or (sb-ext:posix-getenv "SECP256K1_DIR")
                                       (namestring (merge-pathnames "secp256k1-fast" (user-homedir-pathname))))))
       asdf:*central-registry*)
+(push (pathname (format nil "~a/" (or (sb-ext:posix-getenv "CL_TRANSPORT_DIR")
+                                      (namestring (merge-pathnames "cl-transport" (user-homedir-pathname))))))
+      asdf:*central-registry*)
 (let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
   (when (probe-file ql) (load ql)))
 (let ((*standard-output* (make-broadcast-stream)))   ; quiet, but load ERRORS still print

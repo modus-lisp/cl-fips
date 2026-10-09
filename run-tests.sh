@@ -11,6 +11,7 @@ cd "$(dirname "$0")" && sbcl --noinform --non-interactive \
   --eval '(push (truename ".") asdf:*central-registry*)' \
   --eval "(push #p\"${NATRIUM_DIR:-$HOME/natrium}/\" asdf:*central-registry*)" \
   --eval "(push #p\"${SECP256K1_DIR:-$HOME/secp256k1-fast}/\" asdf:*central-registry*)" \
+  --eval "(push #p\"${CL_TRANSPORT_DIR:-$HOME/cl-transport}/\" asdf:*central-registry*)" \
   --eval '(asdf:load-system "cl-fips/test")' \
   --eval '(let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
             (when (probe-file ql) (load ql)))' \

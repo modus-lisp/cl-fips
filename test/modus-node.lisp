@@ -13,6 +13,7 @@
 (let ((home (or (sb-ext:posix-getenv "HOME") "/home/claude")))
   (dolist (d (list (or (sb-ext:posix-getenv "NATRIUM_DIR") (concatenate 'string home "/natrium"))
                    (or (sb-ext:posix-getenv "SECP256K1_DIR") (concatenate 'string home "/secp256k1-fast"))
+                   (or (sb-ext:posix-getenv "CL_TRANSPORT_DIR") (concatenate 'string home "/cl-transport"))
                    (or (sb-ext:posix-getenv "CL_FIPS_DIR") (concatenate 'string home "/cl-fips"))))
     (push (pathname (concatenate 'string d "/")) asdf:*central-registry*)))
 

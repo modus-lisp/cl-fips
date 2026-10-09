@@ -53,11 +53,11 @@
 
 ;;; The socket adapter.  Development-only: usocket on SBCL.  Nothing in src/
 ;;; depends on it; it only supplies the two closures of a BYTE-PORT.
-;;; The host adapters: UDP and TCP on sb-bsd-sockets, so SBCL and hosted modus
-;;; (which provides the same API) alike.  Nothing in src/ depends on them.
+;;; The host adapters: UDP and TCP links over cl-transport/sockets (sb-bsd-sockets:
+;;; SBCL and hosted modus alike).  Nothing in src/ depends on them.
 (defsystem "cl-fips/transport"
   :description "UDP and TCP adapters for cl-fips links (sb-bsd-sockets: SBCL and modus)."
-  :depends-on ("cl-fips" (:feature :sbcl (:require "sb-bsd-sockets")))
+  :depends-on ("cl-fips" "cl-transport/sockets")
   :components ((:module "transport" :serial t
                 :components ((:file "package") (:file "udp") (:file "tcp")))))
 
