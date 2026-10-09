@@ -6,7 +6,7 @@
 ;;;; SessionDatagrams that are not for it.
 ;;;;
 ;;;; It does no I/O policy of its own.  The caller decides which link has input
-;;;; (on SBCL: usocket's wait-for-input; on modus: whatever the target offers),
+;;;; (transport/: sb-bsd-sockets and poll, on SBCL and on hosted modus alike),
 ;;;; calls NODE-RECEIVE for it, and calls NODE-TICK periodically.  Each call returns
 ;;;; a list of events -- plists whose first element names them -- and prints
 ;;;; nothing.  Time (ms) is passed in.

@@ -53,22 +53,20 @@
 
 ;;; The socket adapter.  Development-only: usocket on SBCL.  Nothing in src/
 ;;; depends on it; it only supplies the two closures of a BYTE-PORT.
-;;; The UDP adapter, on sb-bsd-sockets: SBCL and modus (which provides the same API).
-(defsystem "cl-fips/udp"
-  :description "UDP datagram ports for cl-fips links (sb-bsd-sockets: SBCL and modus)."
-  :depends-on ("cl-fips" (:feature :sbcl (:require "sb-bsd-sockets")))
-  :components ((:module "transport" :serial t :components ((:file "package") (:file "udp")))))
-
-;;; The TCP adapter.  Development use: usocket on SBCL.  Nothing in src/ depends
-;;; on it; it only supplies the closures of a BYTE-PORT.
+;;; The host adapters: UDP and TCP on sb-bsd-sockets, so SBCL and hosted modus
+;;; (which provides the same API) alike.  Nothing in src/ depends on them.
 (defsystem "cl-fips/transport"
-  :description "TCP and UDP adapters for cl-fips links (usocket for TCP; SBCL)."
-  :depends-on ("cl-fips/udp" "usocket")
-  :components ((:module "transport" :components ((:file "tcp")))))
+  :description "UDP and TCP adapters for cl-fips links (sb-bsd-sockets: SBCL and modus)."
+  :depends-on ("cl-fips" (:feature :sbcl (:require "sb-bsd-sockets")))
+  :components ((:module "transport" :serial t
+                :components ((:file "package") (:file "udp") (:file "tcp")))))
+
+;;; The old name of the UDP-only part, kept so a config that names it still loads.
+(defsystem "cl-fips/udp" :depends-on ("cl-fips/transport"))
 
 (defsystem "cl-fips/daemon"
   :description "A runnable FIPS node on SBCL: config, identity file, UDP and TCP listeners, peers."
-  :depends-on ("cl-fips/udp" (:feature :sbcl (:require "sb-posix")))
+  :depends-on ("cl-fips/transport" (:feature :sbcl (:require "sb-posix")))
   :components ((:module "transport" :components ((:file "daemon")))))
 
 (defsystem "cl-fips/stream"
@@ -79,5 +77,5 @@
 
 (defsystem "cl-fips/transport-test"
   :description "FMP over real TCP against the upstream Rust oracle."
-  :depends-on ("cl-fips/test" "cl-fips/transport" "cl-fips/daemon")
+  :depends-on ("cl-fips/test" "cl-fips/transport" "cl-fips/daemon" "usocket")
   :components ((:module "test" :serial t :components ((:file "tcp-test") (:file "udp-test") (:file "daemon-test")))))

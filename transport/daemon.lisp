@@ -1,6 +1,6 @@
 ;;;; daemon.lisp -- a runnable FIPS node on SBCL: config, identity, listeners, peers.
 ;;;;
-;;;; DEVELOPMENT/HOST ADAPTER, like tcp.lisp and udp.lisp: SBCL and usocket.  It
+;;;; HOST ADAPTER, like tcp.lisp and udp.lisp: sb-bsd-sockets, SBCL or modus.  It
 ;;;; is the event loop around a CL-FIPS:FIPS-NODE that src/ deliberately does not
 ;;;; contain -- which socket has input, when to dial, when to give up on a peer --
 ;;;; and the one place that reads a clock.
@@ -384,10 +384,8 @@
     (let* ((sockets (%wait-sockets d))
            (wait (if (%buffered-anywhere-p d) 0 max-wait-ms))
            (ready (cond
-                    ;; TCP too (SBCL): take what UDP has, then wait briefly on TCP, so
-                    ;; neither waits long on the other
-                    (sockets (when (daemon-udp d) (cl-fips.transport:udp-pump (daemon-udp d) :timeout-ms 0))
-                             (cl-fips.transport:tcp-wait sockets (min wait 10)))
+                    ;; TCP too: wait on all of them (UDP is pumped as it arrives)
+                    (sockets (cl-fips.transport:tcp-wait sockets wait :udp (daemon-udp d)))
                     ;; UDP only -- every node on modus -- waits on its one socket
                     ((daemon-udp d) (cl-fips.transport:udp-wait (daemon-udp d) wait) nil)
                     (t (when (plusp wait) (sleep (/ wait 1000))) nil))))
@@ -440,6 +438,9 @@
                    (cond
                      ((>= (length all) 114)
                       (done)
+                      ;; its readiness was this msg1: the new link must not read again
+                      ;; in this step, or it waits on a peer that is waiting for our msg2
+                      (setf ready (remove socket ready))
                       (handler-case
                           (%add-link d (apply #'cl-fips:stream-link-accept
                                               (cl-fips.transport:prefixed-byte-port all port)
@@ -451,7 +452,10 @@
                      (eof (done) (cl-fips:byte-port-close port))))))))))
       (dolist (p (daemon-peers d))
         (when (and (peer-dial p) (eq (peer-transport p) :tcp) (%tcp-ready (peer-dial-socket p) ready))
-          (%dial-input d p)))
+          (let ((socket (peer-dial-socket p)))
+            (%dial-input d p)
+            ;; the same: a dial that just completed has used this readiness
+            (setf ready (remove socket ready)))))
       (loop for l in (copy-list (cl-fips:fips-node-links (daemon-node d)))
             for info = (gethash l (daemon-links d))
             when (eq (getf info :transport) :tcp)

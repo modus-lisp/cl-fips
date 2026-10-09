@@ -1,7 +1,8 @@
 #!/bin/sh
 # run-modus-node.sh -- a cl-fips node running inside MODUS, against a real FIPS node.
 #
-#   FIPS_BIN=/path/to/fips MODUS_BIN=/path/to/modus scripts/run-modus-node.sh [SECS] [dial|accept]
+#   FIPS_BIN=/path/to/fips MODUS_BIN=/path/to/modus [TRANSPORT=udp|tcp] \
+#     scripts/run-modus-node.sh [SECS] [dial|accept]
 #
 # dial    the modus node's config names the upstream node; it dials it over UDP.
 # accept  the upstream node's config names the modus node; it dials modus.
@@ -13,6 +14,7 @@
 set -u
 SECS=${1:-60}
 ARM=${2:-dial}
+T=${TRANSPORT:-udp}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 DIR=$(mktemp -d /tmp/cl-fips-modus-node.XXXXXX)
 NODE="$HERE/scripts/cl-fips-node"
@@ -20,32 +22,33 @@ ECHO_BIN="${ECHO_BIN:-$(dirname "${FIPS_BIN:-/x}")/examples/native-echo}"
 for b in "${FIPS_BIN:-}" "${MODUS_BIN:-}" "$ECHO_BIN"; do
   [ -n "$b" ] && [ -x "$b" ] || { echo "SKIPPED: set FIPS_BIN and MODUS_BIN (and build native-echo)"; exit 0; }
 done
+free_tcp() { python3 -I -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 free_udp() { python3 -I -c 'import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
 "$NODE" keygen "$DIR/node.key" > /dev/null && "$NODE" keygen "$DIR/modus.key" > /dev/null || exit 1
-NPORT=$(free_udp); MPORT=$(free_udp)
+if [ "$T" = tcp ]; then NPORT=$(free_tcp); MPORT=$(free_tcp); else NPORT=$(free_udp); MPORT=$(free_udp); fi
 {
   echo "node:"; echo "  identity:"; echo "    nsec: \"$(head -1 "$DIR/node.key")\""
   echo "  log_level: trace"
   echo "  control:"; echo "    socket_path: \"$DIR/control.sock\""
   echo "  native_api:"; echo "    enabled: true"; echo "    socket_path: \"$DIR/api.sock\""
   echo "tun:"; echo "  enabled: false"; echo "dns:"; echo "  enabled: false"
-  echo "transports:"; echo "  udp:"; echo "    bind_addr: \"127.0.0.1:$NPORT\""
+  echo "transports:"; echo "  $T:"; echo "    bind_addr: \"127.0.0.1:$NPORT\""
   if [ "$ARM" = accept ]; then
     echo "peers:"; echo "  - npub: \"$(cat "$DIR/modus.pub")\""; echo "    alias: \"modus\""
-    echo "    addresses:"; echo "      - transport: udp"; echo "        addr: \"127.0.0.1:$MPORT\""
+    echo "    addresses:"; echo "      - transport: $T"; echo "        addr: \"127.0.0.1:$MPORT\""
   fi
 } > "$DIR/node.yaml"
 if [ "$ARM" = dial ]; then
-  PEERS="((:npub \"$(cat "$DIR/node.pub")\" :transport :udp :addr \"127.0.0.1:$NPORT\" :alias \"node\"))"
+  PEERS="((:npub \"$(cat "$DIR/node.pub")\" :transport :$T :addr \"127.0.0.1:$NPORT\" :alias \"node\"))"
 else
   PEERS="()"
 fi
-echo "(:identity (:key-file \"$DIR/modus.key\") :udp (:bind \"127.0.0.1:$MPORT\") :peers $PEERS)" > "$DIR/modus.conf"
+echo "(:identity (:key-file \"$DIR/modus.key\") :$T (:bind \"127.0.0.1:$MPORT\") :peers $PEERS)" > "$DIR/modus.conf"
 
 "$FIPS_BIN" -c "$DIR/node.yaml" > "$DIR/node.log" 2>&1 & NP=$!
 i=0; until [ -S "$DIR/api.sock" ] || [ $i -ge 50 ]; do sleep 0.2; i=$((i+1)); done
 "$ECHO_BIN" "$DIR/api.sock" 4600 > "$DIR/echo.log" 2>&1 & EP=$!
-echo "== a cl-fips node on modus ($ARM), ${SECS}s"
+echo "== a cl-fips node on modus ($ARM, $T), ${SECS}s"
 MODUS_FIPS_CONFIG="$DIR/modus.conf" MODUS_FIPS_TARGET="$(cat "$DIR/node.pub")" MODUS_FIPS_SECS="$SECS" \
   timeout $((SECS + 900)) "$MODUS_BIN" --script "$HERE/test/modus-node.lisp" > "$DIR/modus.log" 2>&1
 rc=$?

@@ -2,7 +2,7 @@
 ;;;;
 ;;;; Pure: no socket calls, no FFI, no implementation packages.  Bytes move
 ;;;; through a BYTE-PORT, two closures supplied by whoever owns the stream (the
-;;;; SBCL/usocket adapter in transport/, an in-memory pipe in the tests, and
+;;;; sb-bsd-sockets adapter in transport/ (SBCL and hosted modus), an in-memory pipe in the tests, and
 ;;;; eventually a modus socket):
 ;;;;
 ;;;;   (read-exactly N DEADLINE) -> (values OCTETS STATUS)

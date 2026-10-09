@@ -1,68 +1,130 @@
-;;;; tcp.lisp -- a TCP BYTE-PORT for cl-fips stream links, on usocket.
+;;;; tcp.lisp -- TCP for cl-fips stream links, on sb-bsd-sockets.
 ;;;;
-;;;; DEVELOPMENT ADAPTER.  It is written against usocket and has only been run on
-;;;; SBCL; it is not part of the pure system and nothing in src/ names it.  All
-;;;; it does is supply the two closures of a CL-FIPS:BYTE-PORT (read-exactly with
-;;;; an absolute deadline, write-all) plus connect / listen / accept.  A modus
-;;;; port of the transport replaces this file and nothing else.
+;;;; HOST ADAPTER, nothing in src/ names it.  Written against SBCL's own
+;;;; sb-bsd-sockets and SB-SYS:WAIT-UNTIL-FD-USABLE, which modus provides too, so
+;;;; the same file carries TCP links on SBCL and on hosted modus.  It supplies the
+;;;; closures of a CL-FIPS:BYTE-PORT (read-exactly with an absolute deadline,
+;;;; write-all, close) plus connect / listen / accept / wait.
 ;;;;
-;;;; READ-EXACTLY honours its DEADLINE across the whole request, not per byte,
-;;;; so a peer that dribbles a packet slower than the link's deadline is dropped
+;;;; A TCP-SOCKET keeps its OWN receive buffer rather than a Lisp stream's, so "is
+;;;; there input?" has one answer -- bytes in the buffer, or the descriptor
+;;;; readable -- and an event loop can never wait on a descriptor while bytes sit
+;;;; unseen in a stream buffer above it.
+;;;;
+;;;; READ-EXACTLY honours its DEADLINE across the whole request, not per byte, so
+;;;; a peer that dribbles a packet slower than the link's deadline is dropped
 ;;;; (upstream transport/tcp/mod.rs InboundDeadline: "Each deadline covers one
-;;;; complete frame, not a byte").  Buffered bytes are drained with LISTEN before
-;;;; waiting, so data already inside the Lisp stream is never waited for twice.
+;;;; complete frame, not a byte").
 
 (in-package #:cl-fips.transport)
 
+(defconstant +tcp-recv-chunk+ 65536)
 
-(defun socket-byte-port (socket)
-  (let ((stream (usocket:socket-stream socket)))
-    (flet ((read-exactly (n deadline)
-             (let ((buf (make-array n :element-type '(unsigned-byte 8))) (got 0))
-               (flet ((done (status) (return-from read-exactly
-                                       (values (if (= got n) buf (subseq buf 0 got)) status)))
-                      (take () (let ((b (read-byte stream nil nil)))
-                                 (unless b (return-from read-exactly
-                                             (values (subseq buf 0 got) :eof)))
-                                 (setf (aref buf got) b) (incf got))))
-                 (handler-case
-                     (loop
-                       (when (= got n) (done :ok))
-                       (if (listen stream)
-                           (take)
-                           (let ((wait (%seconds-until deadline)))
-                             (when (and wait (<= wait 0)) (done :timeout))
-                             (if (usocket:wait-for-input (list socket) :timeout wait :ready-only t)
-                                 (take)          ; readable: a byte, or EOF -- never blocks
-                                 (done :timeout)))))
-                   (error () (done :eof))))))
-           (write-all (octets)
-             (handler-case (progn (write-sequence octets stream) (finish-output stream) :ok)
-               (error () :closed)))
-           (close-it () (ignore-errors (usocket:socket-close socket))))
-      (cl-fips:make-byte-port #'read-exactly #'write-all #'close-it))))
+(defstruct (tcp-socket (:constructor %make-tcp-socket (sock)))
+  sock
+  (buf (make-array 0 :element-type '(unsigned-byte 8)))
+  (pos 0) (eof nil) (closed nil))
+
+(defun %fd (s)
+  (sb-bsd-sockets:socket-file-descriptor (if (tcp-socket-p s) (tcp-socket-sock s) s)))
+
+(defun %fd-readable-p (s seconds)
+  (ignore-errors (sb-sys:wait-until-fd-usable (%fd s) :input (max 0 seconds))))
+
+(defun %buffered (ts) (- (length (tcp-socket-buf ts)) (tcp-socket-pos ts)))
+
+(defun %fill (ts seconds)
+  "Wait up to SECONDS for input and read what is there.  NIL if nothing came;
+   end of stream sets EOF."
+  (when (and (not (tcp-socket-eof ts)) (%fd-readable-p ts seconds))
+    (multiple-value-bind (buf n)
+        ;; an explicit octet buffer: given NIL, SBCL allocates a CHARACTER one
+        (handler-case (sb-bsd-sockets:socket-receive
+                       (tcp-socket-sock ts)
+                       (make-array +tcp-recv-chunk+ :element-type '(unsigned-byte 8)) +tcp-recv-chunk+)
+          (error () (values nil 0)))
+      (if (or (null n) (zerop n))
+          (setf (tcp-socket-eof ts) t)
+          (setf (tcp-socket-buf ts)
+                (concatenate '(vector (unsigned-byte 8))
+                             (subseq (tcp-socket-buf ts) (tcp-socket-pos ts)) (subseq buf 0 n))
+                (tcp-socket-pos ts) 0))
+      t)))
+
+(defun %take (ts n)
+  (let ((out (subseq (tcp-socket-buf ts) (tcp-socket-pos ts) (+ (tcp-socket-pos ts) n))))
+    (incf (tcp-socket-pos ts) n)
+    (coerce out '(simple-array (unsigned-byte 8) (*)))))
+
+(defun tcp-write (ts octets)
+  "Write all of OCTETS.  :OK or :CLOSED."
+  (handler-case
+      (let ((v (coerce octets '(simple-array (unsigned-byte 8) (*)))) (sent 0))
+        (loop while (< sent (length v))
+              do (let ((n (sb-bsd-sockets:socket-send (tcp-socket-sock ts) (subseq v sent) (- (length v) sent))))
+                   (when (or (null n) (<= n 0)) (return-from tcp-write :closed))
+                   (incf sent n)))
+        :ok)
+    (error () :closed)))
+
+(defun tcp-close (ts)
+  (unless (tcp-socket-closed ts)
+    (setf (tcp-socket-closed ts) t)
+    (ignore-errors (sb-bsd-sockets:socket-close (tcp-socket-sock ts)))))
+
+(defun tcp-shutdown-output (ts)
+  "Half-close: the peer reads end of stream; we can still read."
+  (ignore-errors (sb-bsd-sockets:socket-shutdown (tcp-socket-sock ts) :direction :output)))
+
+(defun socket-byte-port (ts)
+  "A CL-FIPS:BYTE-PORT over the TCP-SOCKET TS."
+  (flet ((read-exactly (n deadline)
+           (loop
+             (when (>= (%buffered ts) n) (return (values (%take ts n) :ok)))
+             (when (tcp-socket-eof ts) (return (values (%take ts (%buffered ts)) :eof)))
+             (let ((wait (%seconds-until deadline)))
+               (when (and wait (<= wait 0)) (return (values (%take ts (%buffered ts)) :timeout)))
+               (unless (%fill ts (or wait 3600))
+                 (when wait (return (values (%take ts (%buffered ts)) :timeout)))))))
+         (write-all (octets) (tcp-write ts octets))
+         (close-it () (tcp-close ts)))
+    (cl-fips:make-byte-port #'read-exactly #'write-all #'close-it)))
+
+(defun %resolve (host)
+  (if (and (vectorp host) (not (stringp host)))
+      host
+      (or (%dotted-quad host)
+          (sb-bsd-sockets:host-ent-address (sb-bsd-sockets:get-host-by-name host)))))
 
 (defun tcp-connect (host port &key (timeout-secs 10))
-  "A BYTE-PORT on a new connection to HOST:PORT.  The second value is the socket."
-  (let ((socket (usocket:socket-connect host port :element-type '(unsigned-byte 8)
-                                                  :timeout timeout-secs :nodelay t)))
-    (values (socket-byte-port socket) socket)))
-
-(defun tcp-read-available (socket)
-  "Whatever bytes SOCKET has now, without waiting.  Returns (values octets eof-p);
-   call it only after WAIT-FOR-INPUT said SOCKET is readable, so that no bytes and
-   no LISTEN means the peer closed."
-  (let ((stream (usocket:socket-stream socket)) (out '()))
+  "A BYTE-PORT on a new connection to HOST:PORT.  The second value is the socket.
+   TIMEOUT-SECS bounds the connect on SBCL (a non-blocking connect); modus's
+   sb-bsd-sockets has no non-blocking connect, so there it is the kernel's."
+  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp))
+        (addr (%resolve host)))
     (handler-case
         (progn
-          (loop while (listen stream) do (push (read-byte stream) out))
-          (if out
-              (values (coerce (nreverse out) '(vector (unsigned-byte 8))) nil)
-              (let ((b (read-byte stream nil nil)))
-                (if b
-                    (values (coerce (list b) '(vector (unsigned-byte 8))) nil)
-                    (values (make-array 0 :element-type '(unsigned-byte 8)) t)))))
-      (error () (values (coerce (nreverse out) '(vector (unsigned-byte 8))) t)))))
+          #+sbcl
+          (progn
+            (setf (sb-bsd-sockets:non-blocking-mode s) t)
+            (handler-case (sb-bsd-sockets:socket-connect s addr port)
+              (sb-bsd-sockets:operation-in-progress () nil))
+            (unless (sb-sys:wait-until-fd-usable (sb-bsd-sockets:socket-file-descriptor s) :output timeout-secs)
+              (error "connect to ~a:~d timed out" host port))
+            ;; the connect's outcome: a refused one shows as an error on the peer name
+            (sb-bsd-sockets:socket-peername s)
+            (setf (sb-bsd-sockets:non-blocking-mode s) nil))
+          #-sbcl
+          (progn timeout-secs (sb-bsd-sockets:socket-connect s addr port))
+          (ignore-errors (setf (sb-bsd-sockets:sockopt-tcp-nodelay s) t))
+          (let ((ts (%make-tcp-socket s)))
+            (values (socket-byte-port ts) ts)))
+      (error (e) (ignore-errors (sb-bsd-sockets:socket-close s)) (error e)))))
+
+(defun tcp-read-available (ts)
+  "Whatever bytes TS has now, without waiting.  Returns (values octets eof-p)."
+  (when (zerop (%buffered ts)) (%fill ts 0))
+  (values (%take ts (%buffered ts)) (and (tcp-socket-eof ts) (zerop (%buffered ts)))))
 
 (defun prefixed-byte-port (prefix port)
   "PORT, with the octets PREFIX (already read off it) served first."
@@ -80,33 +142,54 @@
      (cl-fips::byte-port-write-all port)
      (lambda () (cl-fips:byte-port-close port)))))
 
-(defun tcp-socket-buffered-p (socket)
-  "True if bytes are already inside SOCKET's Lisp stream.  WAIT-FOR-INPUT watches the
-   descriptor, so it cannot see these: an event loop must drain them first."
-  (ignore-errors (listen (usocket:socket-stream socket))))
+(defun tcp-socket-buffered-p (ts)
+  "True if bytes already received sit in TS's buffer: an event loop must take
+   them before waiting on the descriptor."
+  (and (tcp-socket-p ts) (plusp (%buffered ts))))
 
 (defun tcp-listen (&key (host "127.0.0.1") (port 0))
   "Listen on HOST (loopback by default) and PORT (0 = ephemeral)."
-  (usocket:socket-listen host port :reuse-address t :element-type '(unsigned-byte 8)))
+  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
+    (handler-case
+        (progn
+          (setf (sb-bsd-sockets:sockopt-reuse-address s) t)
+          (sb-bsd-sockets:socket-bind s (%resolve host) port)
+          (sb-bsd-sockets:socket-listen s 16)
+          s)
+      (error (e) (ignore-errors (sb-bsd-sockets:socket-close s)) (error e)))))
 
-(defun tcp-listener-port (listener) (usocket:get-local-port listener))
+(defun tcp-listener-port (listener) (nth-value 1 (sb-bsd-sockets:socket-name listener)))
 
 (defun tcp-accept (listener &key timeout-ms)
   "Accept one connection as a BYTE-PORT, or NIL if TIMEOUT-MS passes first.  The
    second value is the socket."
-  (when (usocket:wait-for-input (list listener) :timeout (and timeout-ms (/ timeout-ms 1000d0))
-                                         :ready-only t)
-    (let ((socket (handler-case (usocket:socket-accept listener :element-type '(unsigned-byte 8))
-                    ;; out of descriptors, or the connection went away first
-                    (error () nil))))
-      (when socket (values (socket-byte-port socket) socket)))))
+  (when (%fd-readable-p listener (if timeout-ms (/ timeout-ms 1000) 3600))
+    (let ((s (handler-case (sb-bsd-sockets:socket-accept listener)
+               ;; out of descriptors, or the connection went away first
+               (error () nil))))
+      (when s
+        (ignore-errors (setf (sb-bsd-sockets:sockopt-tcp-nodelay s) t))
+        (let ((ts (%make-tcp-socket s)))
+          (values (socket-byte-port ts) ts))))))
 
-(defun tcp-listener-close (listener) (ignore-errors (usocket:socket-close listener)))
+(defun tcp-listener-close (listener) (ignore-errors (sb-bsd-sockets:socket-close listener)))
 
-(defun tcp-wait (sockets timeout-ms)
-  "The members of SOCKETS (usocket sockets, listeners included) that are readable
-   within TIMEOUT-MS.  A fresh list each call: usocket's single-socket form reuses
-   a stale wait-list after a list wait."
-  (and sockets
-       (handler-case (usocket:wait-for-input sockets :timeout (/ timeout-ms 1000d0) :ready-only t)
-         (error () nil))))
+(defun tcp-wait (sockets timeout-ms &key udp)
+  "The members of SOCKETS (TCP-SOCKETs and listeners) that are readable within
+   TIMEOUT-MS -- bytes already buffered count.  UDP, an endpoint, ends the wait
+   too when it has input (it is pumped).  There is no portable multi-descriptor
+   wait, so this checks every descriptor and sleeps on one in slices of 10 ms:
+   a TCP readiness is seen at most that late."
+  (let ((deadline (+ (get-internal-real-time)
+                     (round (* timeout-ms internal-time-units-per-second) 1000))))
+    (loop
+      (let ((ready (remove-if-not (lambda (s) (or (tcp-socket-buffered-p s) (%fd-readable-p s 0))) sockets)))
+        (when (and udp (plusp (udp-pump udp :timeout-ms 0)))
+          (return ready))
+        (when ready (return ready))
+        (let ((left (- deadline (get-internal-real-time))))
+          (when (<= left 0) (return nil))
+          (let ((slice (min 0.01 (/ left internal-time-units-per-second))))
+            (if udp
+                (udp-pump udp :timeout-ms (round (* slice 1000)))
+                (%fd-readable-p (first sockets) slice))))))))

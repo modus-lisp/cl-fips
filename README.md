@@ -294,11 +294,16 @@ recvfrom with the sender, and poll were added to its shim for this).
 `scripts/run-modus-node.sh` runs a cl-fips node inside `modus --script` against
 the real upstream node:
 
-- **dial:** the link is up in 1.3 s and the session in 4 s; 18 of 18 echoes came
-  back. The node logs our heartbeats, our ReceiverReports and the session.
-- **accept:** the upstream node dials the modus node; 13 of 13 echoes came back.
+| | link up | echoes |
+|---|---|---|
+| UDP, modus dials the node | 1.3 s | 18 of 18 |
+| UDP, the node dials modus | (at the node's 15 s resend: modus was still loading) | 13 of 13 |
+| TCP, modus dials the node | 1.8 s | 18 of 18 |
+| TCP, the node dials modus | 11 s | 15 of 15 |
 
-TCP (usocket) and the stream layer (threads, Gray streams) stay SBCL-only. On
+Each time, the node logs our heartbeats, our ReceiverReports and the session.
+Both adapters are on `sb-bsd-sockets`, so the same files run on SBCL and modus.
+Only the stream/gateway layer (threads, Gray streams) stays SBCL-only. On
 modus a Noise IK handshake takes about 3 s, and link frames run at about 120 KB/s.
 
 ## Road to 1.0

@@ -107,7 +107,7 @@
   (%wake c))
 
 (defun %close-socket (c)
-  (when (conn-socket c) (ignore-errors (usocket:socket-close (conn-socket c))) (setf (conn-socket c) nil)))
+  (when (conn-socket c) (cl-fips.transport:tcp-close (conn-socket c)) (setf (conn-socket c) nil)))
 
 ;;; --- the daemon thread: sending -------------------------------------------------------
 
@@ -242,15 +242,14 @@
 (defun %deliver (c payload)
   "In-order bytes for the local side: the caller's inbox, or the gateway's socket."
   (if (conn-socket c)
-      (handler-case (let ((s (usocket:socket-stream (conn-socket c))))
-                      (write-sequence payload s) (finish-output s))
-        (error () (%fail c "the TCP connection failed")))
+      (unless (eq (cl-fips.transport:tcp-write (conn-socket c) payload) :ok)
+        (%fail c "the TCP connection failed"))
       (setf (conn-inbox c) (append (conn-inbox c) (list payload)))))
 
 (defun %peer-fin (c)
   (setf (conn-eof c) t)
   (when (conn-socket c)
-    (ignore-errors (usocket:socket-shutdown (conn-socket c) :output))))
+    (cl-fips.transport:tcp-shutdown-output (conn-socket c))))
 
 (defun %on-frame (ep peer frame)
   (when (< (length frame) +header+) (return-from %on-frame))
@@ -337,8 +336,7 @@
                  (port (ignore-errors (parse-integer target :start (1+ colon)))))
              (bt:make-thread
               (lambda ()
-                (let ((sock (handler-case (usocket:socket-connect host port :element-type '(unsigned-byte 8)
-                                                                            :timeout 10)
+                (let ((sock (handler-case (nth-value 1 (cl-fips.transport:tcp-connect host port :timeout-secs 10))
                               (error (e) (princ-to-string e)))))
                   (bt:with-lock-held ((endpoint-lock ep))
                     (if (stringp sock)
@@ -364,8 +362,7 @@
                  (push c socks)))
              (endpoint-conns ep))
     (when socks
-      (let ((ready (ignore-errors (usocket:wait-for-input (mapcar #'conn-socket socks)
-                                                          :timeout 0 :ready-only t))))
+      (let ((ready (cl-fips.transport:tcp-wait (mapcar #'conn-socket socks) 0)))
         (dolist (c socks)
           (when (member (conn-socket c) ready)
             (multiple-value-bind (bytes eof) (cl-fips.transport:tcp-read-available (conn-socket c))

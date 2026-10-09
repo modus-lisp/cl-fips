@@ -1,5 +1,5 @@
-;;;; package.lisp -- CL-FIPS.TRANSPORT, shared by the UDP adapter (portable: SBCL
-;;;; and modus, on sb-bsd-sockets) and the TCP adapter (SBCL, on usocket).
+;;;; package.lisp -- CL-FIPS.TRANSPORT: the UDP and TCP adapters, both on
+;;;; sb-bsd-sockets, so both run on SBCL and on hosted modus.
 ;;;; The TCP names are exported here even where tcp.lisp is not loaded, so code
 ;;;; that mentions them (the daemon) reads everywhere and fails only if it is
 ;;;; asked for TCP where there is none.
@@ -8,7 +8,8 @@
   (:use #:common-lisp)
   (:export #:tcp-connect #:tcp-listen #:tcp-listener-port #:tcp-accept #:tcp-listener-close
            #:socket-byte-port #:tcp-socket-buffered-p #:tcp-read-available #:prefixed-byte-port
-           #:tcp-wait #:tcp-available-p
+           #:tcp-wait #:tcp-available-p #:tcp-write #:tcp-close #:tcp-shutdown-output
+           #:tcp-socket #:tcp-socket-p
            #:udp-endpoint-socket
            #:+udp-mtu+ #:udp-open #:udp-close #:udp-endpoint-local-port #:udp-pump #:udp-wait
            #:udp-peer-port #:udp-accept #:udp-port-ready-p #:udp-accept-pending-p
