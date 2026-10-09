@@ -53,20 +53,28 @@
 
 ;;; The socket adapter.  Development-only: usocket on SBCL.  Nothing in src/
 ;;; depends on it; it only supplies the two closures of a BYTE-PORT.
+;;; The UDP adapter, on sb-bsd-sockets: SBCL and modus (which provides the same API).
+(defsystem "cl-fips/udp"
+  :description "UDP datagram ports for cl-fips links (sb-bsd-sockets: SBCL and modus)."
+  :depends-on ("cl-fips" (:feature :sbcl (:require "sb-bsd-sockets")))
+  :components ((:module "transport" :serial t :components ((:file "package") (:file "udp")))))
+
+;;; The TCP adapter.  Development use: usocket on SBCL.  Nothing in src/ depends
+;;; on it; it only supplies the closures of a BYTE-PORT.
 (defsystem "cl-fips/transport"
-  :description "TCP and UDP adapters for cl-fips links (usocket; SBCL development use)."
-  :depends-on ("cl-fips" "usocket")
-  :components ((:module "transport" :serial t :components ((:file "tcp") (:file "udp")))))
+  :description "TCP and UDP adapters for cl-fips links (usocket for TCP; SBCL)."
+  :depends-on ("cl-fips/udp" "usocket")
+  :components ((:module "transport" :components ((:file "tcp")))))
 
 (defsystem "cl-fips/daemon"
   :description "A runnable FIPS node on SBCL: config, identity file, UDP and TCP listeners, peers."
-  :depends-on ("cl-fips/transport" (:require "sb-posix"))
+  :depends-on ("cl-fips/udp" (:feature :sbcl (:require "sb-posix")))
   :components ((:module "transport" :components ((:file "daemon")))))
 
 (defsystem "cl-fips/stream"
   :description "Byte streams over FIPS between cl-fips nodes, a TCP gateway, and
                 cl-transport's :fips backend (SBCL)."
-  :depends-on ("cl-fips/daemon" "cl-transport" "cl-transport/tcp" "bordeaux-threads")
+  :depends-on ("cl-fips/daemon" "cl-fips/transport" "cl-transport" "cl-transport/tcp" "bordeaux-threads")
   :components ((:module "transport" :components ((:file "fips-stream")))))
 
 (defsystem "cl-fips/transport-test"

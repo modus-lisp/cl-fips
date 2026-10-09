@@ -19,6 +19,6 @@ exec sbcl --noinform --non-interactive --no-userinit \
             (if (find-package "QL")
                 (funcall (find-symbol "QUICKLOAD" "QL") "usocket" :silent t)
                 (asdf:load-system "usocket"))
-            (asdf:load-system "cl-fips/daemon"))' \
+            (asdf:load-system "cl-fips/transport") (asdf:load-system "cl-fips/daemon"))' \
   --eval '(cl-fips.daemon:main (rest (member "cl-fips-node" sb-ext:*posix-argv* :test (function string=))))' \
   --end-toplevel-options cl-fips-node "$@"

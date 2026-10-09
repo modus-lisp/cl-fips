@@ -12,19 +12,8 @@
 ;;;; complete frame, not a byte").  Buffered bytes are drained with LISTEN before
 ;;;; waiting, so data already inside the Lisp stream is never waited for twice.
 
-(defpackage #:cl-fips.transport
-  (:use #:common-lisp)
-  (:export #:tcp-connect #:tcp-listen #:tcp-listener-port #:tcp-accept #:tcp-listener-close
-           #:socket-byte-port #:tcp-socket-buffered-p #:tcp-read-available #:prefixed-byte-port #:udp-endpoint-socket
-           #:+udp-mtu+ #:udp-open #:udp-close #:udp-endpoint-local-port #:udp-pump
-           #:udp-peer-port #:udp-accept #:udp-port-ready-p #:udp-accept-pending-p
-           #:udp-endpoint-received #:udp-endpoint-dropped #:udp-offer))
-
 (in-package #:cl-fips.transport)
 
-(defun %seconds-until (deadline)
-  (and deadline
-       (/ (float (- deadline (get-internal-real-time)) 1d0) internal-time-units-per-second)))
 
 (defun socket-byte-port (socket)
   (let ((stream (usocket:socket-stream socket)))
@@ -113,3 +102,11 @@
       (when socket (values (socket-byte-port socket) socket)))))
 
 (defun tcp-listener-close (listener) (ignore-errors (usocket:socket-close listener)))
+
+(defun tcp-wait (sockets timeout-ms)
+  "The members of SOCKETS (usocket sockets, listeners included) that are readable
+   within TIMEOUT-MS.  A fresh list each call: usocket's single-socket form reuses
+   a stale wait-list after a list wait."
+  (and sockets
+       (handler-case (usocket:wait-for-input sockets :timeout (/ timeout-ms 1000d0) :ready-only t)
+         (error () nil))))

@@ -168,6 +168,8 @@
     (let ((tcp (getf config :tcp)))
       (when tcp
         (multiple-value-bind (host port) (parse-host-port (or (getf tcp :bind) "127.0.0.1:8443"))
+          (unless (cl-fips.transport:tcp-available-p)
+            (error "this Lisp has no TCP adapter loaded (cl-fips/transport, SBCL): drop :tcp from the config"))
           (setf (daemon-tcp-listener d) (cl-fips.transport:tcp-listen :host host :port port)))))
     (%emit d (list :started (daemon-npub d) (daemon-udp-port d) (daemon-tcp-port d)))
     d))
@@ -194,7 +196,9 @@
   "A one-line description of EVENT; links and addresses shortened."
   (format nil "~(~a~)~{ ~a~}" (first event)
           (mapcar (lambda (x)
-                    (cond ((typep x '(vector (unsigned-byte 8)))
+                    ;; a string first: on modus (typep "abc" '(vector (unsigned-byte 8))) is T
+                    (cond ((stringp x) x)
+                          ((typep x '(vector (unsigned-byte 8)))
                            (if (= (length x) 16) (%short x) (format nil "<~d bytes>" (length x))))
                           ((cl-fips::stream-link-p x)
                            (format nil "link:~a" (%short (cl-fips:node-link-peer x))))
@@ -346,8 +350,8 @@
   (or (member socket ready) (cl-fips.transport:tcp-socket-buffered-p socket)))
 
 (defun %wait-sockets (d)
+  "The TCP sockets worth waiting on (UDP is waited on separately)."
   (let ((s '()))
-    (when (daemon-udp d) (push (cl-fips.transport:udp-endpoint-socket (daemon-udp d)) s))
     (when (daemon-tcp-listener d) (push (daemon-tcp-listener d) s))
     (maphash (lambda (l info)
                (when (and (eq (getf info :transport) :tcp)
@@ -379,11 +383,14 @@
     ;; wait
     (let* ((sockets (%wait-sockets d))
            (wait (if (%buffered-anywhere-p d) 0 max-wait-ms))
-           (ready (and sockets
-                       (handler-case
-                           (usocket:wait-for-input sockets :timeout (/ wait 1000d0) :ready-only t)
-                         (error () nil)))))
-      (when (and (null sockets) (plusp wait)) (sleep (/ wait 1000d0)))
+           (ready (cond
+                    ;; TCP too (SBCL): take what UDP has, then wait briefly on TCP, so
+                    ;; neither waits long on the other
+                    (sockets (when (daemon-udp d) (cl-fips.transport:udp-pump (daemon-udp d) :timeout-ms 0))
+                             (cl-fips.transport:tcp-wait sockets (min wait 10)))
+                    ;; UDP only -- every node on modus -- waits on its one socket
+                    ((daemon-udp d) (cl-fips.transport:udp-wait (daemon-udp d) wait) nil)
+                    (t (when (plusp wait) (sleep (/ wait 1000))) nil))))
       ;; UDP: drain the socket, then every queue
       (let ((udp (daemon-udp d)))
         (when udp
@@ -560,6 +567,6 @@
        (let ((d (make-daemon (load-config (second args)))))
          (daemon-start d)
          (handler-case (daemon-run d)
-           (sb-sys:interactive-interrupt () nil))
+           (#+sbcl sb-sys:interactive-interrupt #-sbcl serious-condition () nil))
          (daemon-stop d)))
       (t (usage)))))

@@ -1,7 +1,9 @@
-;;;; udp.lisp -- UDP datagram ports for cl-fips links, on usocket.
+;;;; udp.lisp -- UDP datagram ports for cl-fips links, on sb-bsd-sockets.
 ;;;;
-;;;; DEVELOPMENT ADAPTER, like tcp.lisp: usocket, run on SBCL, nothing in src/
-;;;; names it.  UDP is FIPS's default transport (upstream transport/udp: one
+;;;; HOST ADAPTER, nothing in src/ names it.  Written against SBCL's own
+;;;; sb-bsd-sockets and SB-SYS:WAIT-UNTIL-FD-USABLE, which modus provides too
+;;;; (net/sb-sys-shim.lisp), so the same file runs a node on SBCL and on hosted
+;;;; modus.  UDP is FIPS's default transport (upstream transport/udp: one
 ;;;; socket serves every peer, each datagram is one whole FMP packet, MTU 1280).
 ;;;;
 ;;;; One socket, many links: a UDP-ENDPOINT owns the socket and sorts arriving
@@ -26,21 +28,45 @@
 
 (defstruct (udp-peer (:conc-name upeer-)) key host port (queue '()) (tail '()) port-object)
 
+(defun %dotted-quad (host)
+  "#(a b c d) for a dotted-quad string, else NIL."
+  (let ((parts '()) (start 0))
+    (loop for dot = (position #\. host :start start)
+          do (push (subseq host start dot) parts)
+             (if dot (setf start (1+ dot)) (return)))
+    (when (= (length parts) 4)
+      (let ((nums (mapcar (lambda (p) (ignore-errors (parse-integer p))) (nreverse parts))))
+        (when (every (lambda (n) (and n (<= 0 n 255))) nums)
+          (coerce nums 'vector))))))
+
 (defun %host-octets (host)
-  (coerce (usocket::host-to-vector-quad host) 'list))
+  "HOST (a dotted quad, a name, or a 4-element vector) as a list of 4 octets."
+  (coerce (cond ((and (vectorp host) (not (stringp host))) host)
+                ((%dotted-quad host))
+                (t (sb-bsd-sockets:host-ent-address (sb-bsd-sockets:get-host-by-name host))))
+          'list))
 
 (defun udp-open (&key (host "127.0.0.1") (port 0))
   "A UDP endpoint bound to HOST:PORT (loopback, ephemeral by default)."
-  (%make-udp-endpoint
-   (usocket:socket-connect nil nil :protocol :datagram :element-type '(unsigned-byte 8)
-                                   :local-host host :local-port port)))
+  (let ((s (make-instance 'sb-bsd-sockets:inet-socket :type :datagram :protocol :udp)))
+    (handler-case (sb-bsd-sockets:socket-bind s (coerce (%host-octets host) 'vector) port)
+      (error (e) (ignore-errors (sb-bsd-sockets:socket-close s)) (error e)))
+    (%make-udp-endpoint s)))
 
-(defun udp-endpoint-local-port (ep) (usocket:get-local-port (udp-endpoint-socket ep)))
+(defun udp-endpoint-local-port (ep)
+  (nth-value 1 (sb-bsd-sockets:socket-name (udp-endpoint-socket ep))))
 
 (defun udp-close (ep)
   (unless (udp-endpoint-closed ep)
     (setf (udp-endpoint-closed ep) t)
-    (ignore-errors (usocket:socket-close (udp-endpoint-socket ep)))))
+    (ignore-errors (sb-bsd-sockets:socket-close (udp-endpoint-socket ep)))))
+
+(defun %readable-p (ep timeout-ms)
+  "Wait up to TIMEOUT-MS for a datagram on EP's socket."
+  (and (not (udp-endpoint-closed ep))
+       (ignore-errors
+        (sb-sys:wait-until-fd-usable (sb-bsd-sockets:socket-file-descriptor (udp-endpoint-socket ep))
+                                     :input (/ (max 0 timeout-ms) 1000)))))
 
 (defun %enqueue (peer packet)
   (let ((cell (list packet)))
@@ -60,7 +86,7 @@
   "Read one datagram that is already waiting and file it.  Returns T if one was read."
   (let ((buf (make-array 65536 :element-type '(unsigned-byte 8))))
     (multiple-value-bind (b size host port)
-        (handler-case (usocket:socket-receive (udp-endpoint-socket ep) buf (length buf))
+        (handler-case (sb-bsd-sockets:socket-receive (udp-endpoint-socket ep) buf (length buf))
           (error () (values nil nil nil nil)))
       (declare (ignore b))
       (when (and size host)
@@ -87,13 +113,16 @@
   (if (udp-endpoint-closed ep)
       0
       (let ((n 0))
-        (when (usocket:wait-for-input (list (udp-endpoint-socket ep))
-                                      :timeout (/ (max 0 timeout-ms) 1000d0) :ready-only t)
+        (when (%readable-p ep timeout-ms)
           (loop while (and (%receive-one ep)
                            (progn (incf n) t)
-                           (usocket:wait-for-input (list (udp-endpoint-socket ep))
-                                                   :timeout 0 :ready-only t))))
+                           (%readable-p ep 0))))
         n)))
+
+(defun udp-wait (ep timeout-ms)
+  "Wait up to TIMEOUT-MS for input on EP, then read whatever is there.  The
+   number of datagrams read."
+  (udp-pump ep :timeout-ms timeout-ms))
 
 (defun %peer-port (ep peer)
   (let ((socket (udp-endpoint-socket ep)))
@@ -108,9 +137,9 @@
                  (udp-pump ep :timeout-ms (if wait (ceiling (* 1000 wait)) 1000)))))
            (write-all (octets)
              (handler-case
-                 (progn (usocket:socket-send socket octets (length octets)
-                                             :host (coerce (upeer-host peer) 'vector)
-                                             :port (upeer-port peer))
+                 (progn (sb-bsd-sockets:socket-send socket octets (length octets)
+                                                    :address (list (coerce (upeer-host peer) 'vector)
+                                                                   (upeer-port peer)))
                         :ok)
                (error () :closed)))
            (close-it () (remhash (upeer-key peer) (udp-endpoint-peers ep))))

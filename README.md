@@ -281,8 +281,25 @@ these come from):
 - **IPv6 / TUN.** Applications use the Lisp API, not a network interface.
 - **NAT traversal, Nostr discovery, the Tor and BLE transports, and the native
   API socket.**
-- **Running on modus.** The protocol code is written to be portable, but nothing
-  has been run on modus. The tests use `sb-ext`, and the transport uses `usocket`.
+- **Bare-metal modus.** Hosted modus runs a node (below); bare metal needs a UDP
+  port over modus's own NIC stack.
+- **Constant-time ECDH off SBCL.** secp256k1-fast's constant-time multiply is
+  SBCL-only, so on modus the DH takes secret-dependent time.
+
+## On modus
+
+The daemon runs unchanged inside hosted modus. The UDP adapter is written against
+`sb-bsd-sockets` and `sb-sys:wait-until-fd-usable`, which modus provides (sendto,
+recvfrom with the sender, and poll were added to its shim for this).
+`scripts/run-modus-node.sh` runs a cl-fips node inside `modus --script` against
+the real upstream node:
+
+- **dial:** the link is up in 1.3 s and the session in 4 s; 18 of 18 echoes came
+  back. The node logs our heartbeats, our ReceiverReports and the session.
+- **accept:** the upstream node dials the modus node; 13 of 13 echoes came back.
+
+TCP (usocket) and the stream layer (threads, Gray streams) stay SBCL-only. On
+modus a Noise IK handshake takes about 3 s, and link frames run at about 120 KB/s.
 
 ## Road to 1.0
 
