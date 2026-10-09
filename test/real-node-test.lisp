@@ -219,10 +219,23 @@
                             (cl-fips:stream-link-send link reply)
                             (out "~6d FSP SessionAck received; SessionMsg3 sent; session established"
                                  (- (ms) t0))))
+                         ((= (cl-fips:prefix-phase payload) 1)
+                          ;; the node rekeys the FSP session: answer its msg1 with SessionAck
+                          (let ((reply (cl-fips:fsp-handle-rekey-setup fsp (subseq m 1))))
+                            (cl-fips:stream-link-send link reply)
+                            (out "~6d FSP rekey: SessionSetup answered with SessionAck" (- (ms) t0))))
+                         ((= (cl-fips:prefix-phase payload) 3)
+                          (cl-fips:fsp-handle-rekey-msg3 fsp (subseq m 1))
+                          (out "~6d FSP rekey: SessionMsg3 taken; the new session waits for its first frame"
+                               (- (ms) t0)))
                          ((zerop (cl-fips:prefix-phase payload))
                           (multiple-value-bind (mt sp dp data)
                               (handler-case
-                                  (cl-fips:fsp-open-data (cl-fips:fsp-initiator-session fsp) payload)
+                                  (let ((had-pending (cl-fips::fsp-initiator-pending-session fsp)))
+                                    (multiple-value-prog1 (cl-fips:fsp-open-any fsp payload)
+                                      (when (and had-pending (null (cl-fips::fsp-initiator-pending-session fsp)))
+                                        (out "~6d FSP rekey cutover: the node's new session is current"
+                                             (- (ms) t0)))))
                                 (error (e)
                                   (multiple-value-bind (fl plen ctr) (cl-fips:decode-fsp-header payload)
                                     (out "~6d FSP frame did not open: flags=~d payload_len=~d counter=~d (~a)"

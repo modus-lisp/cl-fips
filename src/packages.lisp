@@ -32,6 +32,8 @@
            #:fsp-seal-data #:fsp-open-data
            #:make-fsp-initiator #:fsp-initiator-phase #:fsp-initiator-session
            #:fsp-setup-datagram #:fsp-handle-ack #:fsp-data-datagram #:fsp-initiator-our-addr
+           #:fsp-handle-rekey-setup #:fsp-handle-rekey-msg3 #:fsp-open-any
+           #:fsp-initiator-previous-session #:fsp-initiator-pending-session #:fsp-initiator-k
            #:fips-make-xk-initiator #:fips-make-xk-responder
            ;; FMP established frames (fmp.lisp)
            #:+flag-key-epoch+ #:+flag-ce+ #:+flag-sp+ #:+inner-header-size+

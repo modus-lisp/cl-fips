@@ -103,8 +103,9 @@
 ;;; --- Established frames -------------------------------------------------------
 
 (defconstant +fsp-flag-cp+ #x01 "Coords Present: cleartext coordinates follow the header.")
+(defconstant +fsp-flag-k+ #x02 "Key epoch: the frame is sealed under the rekeyed session.")
 
-(defun fsp-seal-data (session src-port dst-port data timestamp-ms &key coords)
+(defun fsp-seal-data (session src-port dst-port data timestamp-ms &key coords k)
   "An established FSP frame carrying a DataPacket.  COORDS, when given, is
    (src-addrs dest-addrs) and sets CP: the two cleartext coordinates sit between
    the header and the ciphertext, and are not part of the AAD.  Returns the wire
@@ -114,7 +115,7 @@
                            (encode-u16le src-port) (encode-u16le dst-port)
                            data))
          (counter (natrium.noise:session-current-send-counter session))
-         (flags (if coords +fsp-flag-cp+ 0))
+         (flags (logior (if coords +fsp-flag-cp+ 0) (if k +fsp-flag-k+ 0)))
          (header (encode-fsp-header flags (length inner) counter))
          (ct (natrium.noise:session-encrypt-with-aad session inner header))
          (cleartext (if coords
@@ -167,16 +168,22 @@
 ;;; --- The initiator's side of the session ------------------------------------
 
 (defstruct (fsp-initiator (:constructor %make-fsp-initiator))
-  hs              ; natrium.noise XK handshake state
-  session         ; established NOISE-SESSION, or NIL until msg3 is sent
+  hs              ; natrium.noise XK handshake state (our initial handshake)
+  session         ; the established NOISE-SESSION, or NIL until msg3 is sent
   our-addr peer-addr our-coords peer-coords
-  (phase :idle))  ; :idle :setup-sent :established
+  (phase :idle)   ; :idle :setup-sent :established
+  static local-epoch          ; for answering the peer's rekey
+  pending-hs      ; a rekey we are answering: XK responder, after msg2 is sent
+  pending-session ; the rekeyed session, waiting for its first authenticated frame
+  previous-session ; the session we replaced, kept for late frames
+  (k nil))        ; the K bit we set on frames sent under the current session
 
 (defun make-fsp-initiator (static peer-static-bytes local-epoch our-addr peer-addr
                            our-coords peer-coords)
   (%make-fsp-initiator :hs (fips-make-xk-initiator static peer-static-bytes local-epoch)
                        :our-addr our-addr :peer-addr peer-addr
-                       :our-coords our-coords :peer-coords peer-coords))
+                       :our-coords our-coords :peer-coords peer-coords
+                       :static static :local-epoch local-epoch))
 
 (defun fsp-setup-datagram (fi)
   "Start the handshake: the SessionDatagram that carries SessionSetup (XK msg1)."
@@ -214,4 +221,73 @@
   (unless (eq (fsp-initiator-phase fi) :established) (error "session is not established"))
   (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi)
                            (fsp-seal-data (fsp-initiator-session fi) src-port dst-port
-                                          data timestamp-ms)))
+                                          data timestamp-ms :k (fsp-initiator-k fi))))
+
+;;; --- Session rekey, answered as responder -----------------------------------
+;;; The node starts an FSP rekey on the established session: SessionSetup (XK
+;;; msg1), we answer SessionAck (msg2), it sends SessionMsg3 (msg3).  The rekeyed
+;;; session is adopted when a frame first opens under it; the one it replaces is
+;;; kept as the previous session for late frames.
+
+(defun fsp-handle-rekey-setup (fi datagram-body)
+  "Answer a SessionSetup that rekeys the established session.  Returns the
+   SessionDatagram body that carries SessionAck (XK msg2)."
+  (unless (eq (fsp-initiator-phase fi) :established)
+    (error "a rekey needs an established session"))
+  (multiple-value-bind (src dest ttl mtu payload) (decode-session-datagram datagram-body)
+    (declare (ignore ttl mtu))
+    (unless (and (equalp src (fsp-initiator-peer-addr fi))
+                 (equalp dest (fsp-initiator-our-addr fi)))
+      (error "rekey SessionSetup is not from our peer"))
+    (multiple-value-bind (phase flags src-c dest-c msg1) (decode-fsp-setup-or-ack payload)
+      (declare (ignore flags src-c dest-c))
+      (unless (= phase 1) (error "expected SessionSetup, got phase ~d" phase))
+      (let ((hs (fips-make-xk-responder (fsp-initiator-static fi) (fsp-initiator-local-epoch fi))))
+        (natrium.noise:xk-read-message-1 hs msg1)
+        (let* ((msg2 (natrium.noise:xk-write-message-2 hs))
+               (ack (encode-fsp-setup-or-ack 2 0 (fsp-initiator-our-coords fi)
+                                             (fsp-initiator-peer-coords fi) msg2)))
+          (setf (fsp-initiator-pending-hs fi) hs)
+          (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi) ack))))))
+
+(defun fsp-handle-rekey-msg3 (fi datagram-body)
+  "Consume SessionMsg3 (XK msg3) of a rekey we answered.  The rekeyed session waits
+   for its first authenticated frame before it takes over."
+  (unless (fsp-initiator-pending-hs fi) (error "no rekey is outstanding"))
+  (multiple-value-bind (src dest ttl mtu payload) (decode-session-datagram datagram-body)
+    (declare (ignore ttl mtu))
+    (unless (and (equalp src (fsp-initiator-peer-addr fi))
+                 (equalp dest (fsp-initiator-our-addr fi)))
+      (error "rekey SessionMsg3 is not from our peer"))
+    (let ((hs (fsp-initiator-pending-hs fi)))
+      (natrium.noise:xk-read-message-3 hs (decode-fsp-msg3 payload))
+      (setf (fsp-initiator-pending-session fi) (natrium.noise:handshake-into-session hs)
+            (fsp-initiator-pending-hs fi) nil)
+      t)))
+
+(defun fsp-open-any (fi wire)
+  "Open an established frame.  It is tried under the current session, then under
+   the rekeyed session (which completes the cutover: it becomes current and the
+   one it replaces becomes the previous session), then under the previous session
+   (late frames sent before the cutover).  Returns the values FSP-OPEN-DATA
+   returns; a frame that opens under none of them is refused."
+  (let ((cur (fsp-initiator-session fi))
+        (pend (fsp-initiator-pending-session fi))
+        (prev (fsp-initiator-previous-session fi)))
+    (flet ((try (session)
+             (and session
+                  (handler-case (multiple-value-list (fsp-open-data session wire))
+                    (natrium.noise:noise-error () nil)))))
+      (let ((opened (try cur)))
+        (when opened (return-from fsp-open-any (values-list opened))))
+      (let ((opened (try pend)))
+        (when opened
+          (setf (fsp-initiator-previous-session fi) cur
+                (fsp-initiator-session fi) pend
+                (fsp-initiator-pending-session fi) nil
+                (fsp-initiator-k fi) t)
+          (return-from fsp-open-any (values-list opened))))
+      (let ((opened (try prev)))
+        (when opened (return-from fsp-open-any (values-list opened))))
+      ;; nothing opened: report the failure the way FSP-OPEN-DATA does
+      (fsp-open-data cur wire))))
