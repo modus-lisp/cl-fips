@@ -123,6 +123,14 @@
           do (setf (aref out i) (+ 97 (mod (+ i n) 26))))
     out))
 
+(defun fsp-target-pub ()
+  "CL_FIPS_FSP_PEER_DIR: a directory whose node.key names a node behind our link.
+   The FSP session is then with that node, reached through the linked node (the
+   multi-hop run).  Unset = the linked node itself."
+  (let ((dir (sb-ext:posix-getenv "CL_FIPS_FSP_PEER_DIR")))
+    (and dir (plusp (length dir))
+         (second (read-key (format nil "~a/node.key" dir))))))
+
 (defun rekey-at-seconds ()
   "CL_FIPS_FSP_REKEY_AT: seconds into the exchange at which we start an FSP
    rekey (default 60; \"off\" = never)."
@@ -155,7 +163,11 @@
          (last-frame-log 0)
          (fsp nil) (next-data 0) (data-count 0) (last-probe nil)
          (rekey-at (rekey-at-seconds)) (rekey-started nil)
-         (node-addr (cl-fips:node-addr node-pub))
+         ;; the FSP peer: the node we are linked to, or -- with CL_FIPS_FSP_PEER_DIR
+         ;; set -- a node behind it that the session reaches through that link
+         (fsp-pub (or (fsp-target-pub) node-pub))
+         (fsp-addr (cl-fips:node-addr fsp-pub))
+         (multihop (and (fsp-target-pub) t))
          (our-addr (cl-fips:node-addr (secp256k1-fast.ecdh:keypair-public-bytes static))))
     (loop while (< (ms) deadline) do
       (when (>= (ms) next-hb)
@@ -165,16 +177,23 @@
         (setf next-hb (+ (ms) 5000)))
       ;; the end-to-end session: start once the node's ancestry is known
       (when (and (fsp-enabled-p) (null fsp))
-        (let ((peer-coords (fsp-peer-coords link node-addr))
+        (let ((peer-coords (or (fsp-peer-coords link fsp-addr)
+                               (and multihop (list fsp-addr))))
               (tree (cl-fips:stream-link-tree link)))
           (when (and peer-coords tree (cl-fips:tree-state-entries tree))
             (setf fsp (cl-fips:make-fsp-initiator
-                       static node-pub (natrium:random-bytes 8) our-addr node-addr
+                       static fsp-pub (natrium:random-bytes 8) our-addr fsp-addr
                        (mapcar #'cl-fips:coord-entry-node (cl-fips:tree-state-entries tree))
                        peer-coords))
-            (let ((d (cl-fips:fsp-setup-datagram fsp)))
+            (let ((d (cl-fips:fsp-setup-datagram fsp (ms))))
               (cl-fips:stream-link-send link d)
               (out "~6d FSP SessionSetup sent to the node (XK msg1)" (- (ms) t0))))))
+      ;; an unanswered SessionSetup is sent again (the relay may not know the way yet)
+      (when fsp
+        (let ((again (cl-fips:fsp-resend-setup fsp (ms))))
+          (when again
+            (cl-fips:stream-link-send link again)
+            (out "~6d FSP SessionSetup resent (no SessionAck yet)" (- (ms) t0)))))
       ;; we start the FSP rekey once, after REKEY-AT seconds
       (when (and fsp rekey-at (not rekey-started)
                  (eq (cl-fips:fsp-initiator-phase fsp) :established)

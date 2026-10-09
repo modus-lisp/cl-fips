@@ -34,7 +34,7 @@
            #:fsp-setup-datagram #:fsp-handle-ack #:fsp-data-datagram #:fsp-initiator-our-addr
            #:fsp-handle-rekey-setup #:fsp-handle-rekey-msg3 #:fsp-open-any
            #:fsp-initiator-previous-session #:fsp-initiator-pending-session #:fsp-initiator-k
-           #:fsp-start-rekey #:fsp-handle-rekey-ack
+           #:fsp-start-rekey #:fsp-handle-rekey-ack #:fsp-resend-setup #:fsp-initiator-setup-tries
            #:fips-make-xk-initiator #:fips-make-xk-responder
            ;; FMP established frames (fmp.lisp)
            #:+flag-key-epoch+ #:+flag-ce+ #:+flag-sp+ #:+inner-header-size+

@@ -289,6 +289,34 @@
                      (handler-case (progn (fsp-open-any fi stranger) nil)
                        (natrium.noise:noise-error () t))))))))))
 
+(defun test-fsp-resend-setup ()
+  "An unanswered SessionSetup is sent again, the same msg1, on an interval, a bounded
+   number of times; an answered one is never resent."
+  (let* ((ka (generate-keypair)) (kb (generate-keypair))
+         (a (fsp-addr 10)) (b (fsp-addr 20))
+         (fi (make-fsp-initiator ka (keypair-public-bytes kb) (octets 1 1 1 1 1 1 1 1)
+                                 a b (list a) (list b)))
+         (first (fsp-setup-datagram fi 1000)))
+    (check "no resend before the interval has passed"
+           (null (fsp-resend-setup fi 3000)))
+    (let ((again (fsp-resend-setup fi 5000)))
+      (check "after the interval the same SessionSetup is sent again"
+             (equalp again first)))
+    (check "the interval restarts after a resend"
+           (null (fsp-resend-setup fi 6000)))
+    (loop for k from 1 to 20 do (fsp-resend-setup fi (+ 100000 (* k 10000))))
+    (check "resends stop at the bound"
+           (= (fsp-initiator-setup-tries fi) 10))
+    (let* ((kc (generate-keypair))
+           (fj (make-fsp-initiator ka (keypair-public-bytes kc) (octets 1 1 1 1 1 1 1 1)
+                                   a (fsp-addr 30) (list a) (list (fsp-addr 30)))))
+      (fsp-setup-datagram fj 0)
+      ;; once the SessionAck has been taken the handshake is no longer in setup
+      (setf (fsp-initiator-phase fj) :established)
+      (check "an answered SessionSetup is not resent"
+             (null (fsp-resend-setup fj 999999)))))
+  )
+
 (defun test-fsp ()
   (test-session-datagram)
   (test-coords)
@@ -297,4 +325,5 @@
   (test-fsp-cp-frames)
   (test-fsp-rekey)
   (test-fsp-own-rekey)
+  (test-fsp-resend-setup)
   (test-fsp-wrong-peer))

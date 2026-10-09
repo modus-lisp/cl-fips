@@ -179,7 +179,9 @@
   (k nil)         ; the K bit we set on frames sent under the current session
   rekey-hs        ; a rekey we started: XK initiator, until its msg2 arrives
   rekey-initiator-p ; we started the rekey in flight: cutover is ours, on our next send
-  last-msg3)      ; the msg3 we last took, so a resend of it is not an error
+  last-msg3       ; the msg3 we last took, so a resend of it is not an error
+  setup-datagram  ; our SessionSetup, kept so an unanswered one can be resent
+  (setup-sent-at 0) (setup-tries 0))  ; when it was last sent, and how often
 
 (defun make-fsp-initiator (static peer-static-bytes local-epoch our-addr peer-addr
                            our-coords peer-coords)
@@ -189,13 +191,31 @@
                        :static static :local-epoch local-epoch
                        :peer-static peer-static-bytes))
 
-(defun fsp-setup-datagram (fi)
-  "Start the handshake: the SessionDatagram that carries SessionSetup (XK msg1)."
+(defun fsp-setup-datagram (fi &optional (now 0))
+  "Start the handshake: the SessionDatagram that carries SessionSetup (XK msg1).
+   The datagram is kept, so FSP-RESEND-SETUP can send the same msg1 again."
   (let* ((msg1 (natrium.noise:xk-write-message-1 (fsp-initiator-hs fi)))
          (setup (encode-fsp-setup-or-ack 1 0 (fsp-initiator-our-coords fi)
-                                         (fsp-initiator-peer-coords fi) msg1)))
-    (setf (fsp-initiator-phase fi) :setup-sent)
-    (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi) setup)))
+                                         (fsp-initiator-peer-coords fi) msg1))
+         (datagram (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi)
+                                            setup)))
+    (setf (fsp-initiator-phase fi) :setup-sent
+          (fsp-initiator-setup-datagram fi) datagram
+          (fsp-initiator-setup-sent-at fi) now
+          (fsp-initiator-setup-tries fi) 1)
+    datagram))
+
+(defun fsp-resend-setup (fi now &key (interval-ms 4000) (max-tries 10))
+  "The SessionSetup again, if the handshake is still unanswered and the interval
+   has passed.  Returns the link message to send, or NIL.  The same msg1 goes out:
+   a SessionAck lost on the way is answered the same way."
+  (when (and (eq (fsp-initiator-phase fi) :setup-sent)
+             (fsp-initiator-setup-datagram fi)
+             (< (fsp-initiator-setup-tries fi) max-tries)
+             (>= (- now (fsp-initiator-setup-sent-at fi)) interval-ms))
+    (setf (fsp-initiator-setup-sent-at fi) now)
+    (incf (fsp-initiator-setup-tries fi))
+    (fsp-initiator-setup-datagram fi)))
 
 (defun fsp-handle-ack (fi datagram-body)
   "Consume the SessionAck (XK msg2) carried in a SessionDatagram body.  Returns the
