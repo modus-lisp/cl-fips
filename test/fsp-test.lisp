@@ -317,6 +317,50 @@
              (null (fsp-resend-setup fj 999999)))))
   )
 
+(defun fsp-own-rekey-to-new (fi kb a b now)
+  "Run our rekey to the peer's answer, cutting over on our first frame at NOW.
+   Returns the peer's session under the new keys."
+  (let* ((setup (fsp-start-rekey fi))
+         (rr (fips-make-xk-responder kb (octets 4 4 4 4 4 4 4 4))))
+    (natrium.noise:xk-read-message-1 rr (nth-value 4 (decode-fsp-setup-or-ack
+                                                     (nth-value 4 (decode-session-datagram (subseq setup 1))))))
+    (let* ((m2 (natrium.noise:xk-write-message-2 rr))
+           (ack (encode-session-datagram b a (encode-fsp-setup-or-ack 2 0 (list b) (list a) m2)))
+           (msg3d (fsp-handle-rekey-ack fi (subseq ack 1))))
+      (natrium.noise:xk-read-message-3 rr (decode-fsp-msg3 (nth-value 4 (decode-session-datagram (subseq msg3d 1)))))
+      (prog1 (natrium.noise:handshake-into-session rr)
+        (fsp-data-datagram fi (ascii-octets "cutover") :dst-port 3 :now now)))))
+
+(defun test-fsp-drain ()
+  "The replaced session drains for 10 s after its last use, or 120 s after the
+   cutover at most, as upstream's drain_expired does."
+  ;; the sliding window: a straggler at +9 s opens and refreshes the drain; one at
+  ;; +10 s after that refresh is refused
+  (multiple-value-bind (fi ka kb a b rs-old) (fsp-keyed-session)
+    (declare (ignore ka))
+    (fsp-own-rekey-to-new fi kb a b 1000)
+    (check "a straggler under the replaced session opens during the drain"
+           (equalp (nth-value 3 (fsp-open-any fi (fsp-seal-data rs-old 0 3 (ascii-octets "s1") 1) :now 10000))
+                   (ascii-octets "s1")))
+    (check "a straggler 10 s after the last use is refused"
+           (handler-case (progn (fsp-open-any fi (fsp-seal-data rs-old 0 3 (ascii-octets "s2") 2) :now 20000) nil)
+             (natrium.noise:noise-error () t)))
+    (check "the expired previous session is retired"
+           (null (fsp-initiator-previous-session fi))))
+  ;; the hard cap: a straggler that keeps the drain alive is still retired 120 s
+  ;; after the cutover
+  (multiple-value-bind (fi ka kb a b rs-old) (fsp-keyed-session)
+    (declare (ignore ka))
+    (fsp-own-rekey-to-new fi kb a b 1000)
+    (let ((kept t))
+      (loop for at from 6000 to 111000 by 5000
+            do (unless (nth-value 3 (fsp-open-any fi (fsp-seal-data rs-old 0 3 (ascii-octets "k") at) :now at))
+                 (setf kept nil)))
+      (check "a straggler every 5 s keeps the drain alive until the cap" kept))
+    (check "the cap retires the drain at 120 s, however recently it was used"
+           (handler-case (progn (fsp-open-any fi (fsp-seal-data rs-old 0 3 (ascii-octets "cap") 99) :now 121000) nil)
+             (natrium.noise:noise-error () t)))))
+
 (defun test-fsp ()
   (test-session-datagram)
   (test-coords)
@@ -326,4 +370,5 @@
   (test-fsp-rekey)
   (test-fsp-own-rekey)
   (test-fsp-resend-setup)
+  (test-fsp-drain)
   (test-fsp-wrong-peer))

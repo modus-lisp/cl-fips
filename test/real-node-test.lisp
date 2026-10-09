@@ -211,7 +211,8 @@
                ;; building the datagram is what cuts over a rekey we started
                (cutting (cl-fips::fsp-initiator-rekey-initiator-p fsp))
                (d (cl-fips:fsp-data-datagram fsp payload :dst-port port
-                                                         :timestamp-ms (ldb (byte 32 0) (- (ms) t0)))))
+                                                         :timestamp-ms (ldb (byte 32 0) (- (ms) t0))
+                                                         :now (ms))))
           ;; a DataPacket is 110 bytes of framing around its data on the link (FMP
           ;; header and tag, the SessionDatagram header, the FSP header and tag, the
           ;; inner and port headers); anything above that does not fit the link MTU
@@ -275,7 +276,7 @@
                           (multiple-value-bind (mt sp dp data)
                               (handler-case
                                   (let ((had-pending (cl-fips::fsp-initiator-pending-session fsp)))
-                                    (multiple-value-prog1 (cl-fips:fsp-open-any fsp payload)
+                                    (multiple-value-prog1 (cl-fips:fsp-open-any fsp payload :now (ms))
                                       (when (and had-pending (null (cl-fips::fsp-initiator-pending-session fsp)))
                                         (out "~6d FSP rekey cutover: the node's new session is current"
                                              (- (ms) t0)))))

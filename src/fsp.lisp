@@ -104,6 +104,10 @@
 
 (defconstant +fsp-flag-cp+ #x01 "Coords Present: cleartext coordinates follow the header.")
 (defconstant +fsp-flag-k+ #x02 "Key epoch: the frame is sealed under the rekeyed session.")
+;; upstream proto/fsp/limits.rs DRAIN_WINDOW_SECS = 10, and the hard cap of 12 windows
+;; (node/handlers/rekey.rs DRAIN_MAX_RETENTION_SECS)
+(defconstant +fsp-drain-ms+ 10000)
+(defconstant +fsp-drain-max-ms+ 120000)
 
 (defun fsp-seal-data (session src-port dst-port data timestamp-ms &key coords k)
   "An established FSP frame carrying a DataPacket.  COORDS, when given, is
@@ -181,7 +185,9 @@
   rekey-initiator-p ; we started the rekey in flight: cutover is ours, on our next send
   last-msg3       ; the msg3 we last took, so a resend of it is not an error
   setup-datagram  ; our SessionSetup, kept so an unanswered one can be resent
-  (setup-sent-at 0) (setup-tries 0))  ; when it was last sent, and how often
+  (setup-sent-at 0) (setup-tries 0)  ; when it was last sent, and how often
+  (previous-started-ms 0)   ; when the drain began: the cutover (ms)
+  (previous-last-used-ms 0)) ; the last frame that opened under the previous session
 
 (defun make-fsp-initiator (static peer-static-bytes local-epoch our-addr peer-addr
                            our-coords peer-coords)
@@ -240,10 +246,11 @@
         (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi) ok)))))
 
 (defun fsp-data-datagram (fi data &key (src-port 0) (dst-port +fsp-port-ipv6-shim+)
-                                    (timestamp-ms 0))
-  "A SessionDatagram carrying one DataPacket on the established session."
+                                    (timestamp-ms 0) (now 0))
+  "A SessionDatagram carrying one DataPacket on the established session.  NOW is
+   the time in ms, used if this frame cuts a rekey we started over."
   (unless (eq (fsp-initiator-phase fi) :established) (error "session is not established"))
-  (fsp-cut-over-if-ours fi)
+  (fsp-cut-over-if-ours fi now)
   (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi)
                            (fsp-seal-data (fsp-initiator-session fi) src-port dst-port
                                           data timestamp-ms :k (fsp-initiator-k fi))))
@@ -336,7 +343,30 @@
           (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi)
                                    (encode-fsp-msg3 msg3)))))))
 
-(defun fsp-cut-over-if-ours (fi)
+(defun fsp-begin-drain (fi now)
+  "The session this replaces is kept for late frames, from NOW."
+  (setf (fsp-initiator-previous-started-ms fi) now
+        (fsp-initiator-previous-last-used-ms fi) 0))
+
+(defun fsp-previous-live-p (fi now)
+  "upstream SessionEntry::drain_expired, inverted.  The previous session expires
+   when the hard cap has passed since the drain began, or when DRAIN-MS has passed
+   since the later of the drain start and its last successful decrypt."
+  (let ((started (fsp-initiator-previous-started-ms fi))
+        (used (fsp-initiator-previous-last-used-ms fi)))
+    (and (fsp-initiator-previous-session fi)
+         (< (- now started) +fsp-drain-max-ms+)
+         (< (- now (max started used)) +fsp-drain-ms+))))
+
+(defun fsp-expire-previous (fi now)
+  "Retire the previous session once its drain has ended.  Returns T if it was retired."
+  (when (and (fsp-initiator-previous-session fi) (not (fsp-previous-live-p fi now)))
+    (setf (fsp-initiator-previous-session fi) nil
+          (fsp-initiator-previous-started-ms fi) 0
+          (fsp-initiator-previous-last-used-ms fi) 0)
+    t))
+
+(defun fsp-cut-over-if-ours (fi now)
   "On our first frame under a rekey we started, the new session becomes current
    and the K bit goes on."
   (when (and (fsp-initiator-rekey-initiator-p fi) (fsp-initiator-pending-session fi))
@@ -344,17 +374,20 @@
           (fsp-initiator-session fi) (fsp-initiator-pending-session fi)
           (fsp-initiator-pending-session fi) nil
           (fsp-initiator-rekey-initiator-p fi) nil
-          (fsp-initiator-k fi) t)))
+          (fsp-initiator-k fi) t)
+    (fsp-begin-drain fi now)))
 
-(defun fsp-open-any (fi wire)
+(defun fsp-open-any (fi wire &key (now 0))
   "Open an established frame.  It is tried under the current session, then under
    the rekeyed session (which completes the cutover: it becomes current and the
    one it replaces becomes the previous session), then under the previous session
-   (late frames sent before the cutover).  Returns the values FSP-OPEN-DATA
-   returns; a frame that opens under none of them is refused."
+   while its drain lasts (late frames sent before the cutover).  NOW is the time
+   in ms.  Returns the values FSP-OPEN-DATA returns; a frame that opens under none
+   of them is refused."
+  (fsp-expire-previous fi now)
   (let ((cur (fsp-initiator-session fi))
         (pend (fsp-initiator-pending-session fi))
-        (prev (fsp-initiator-previous-session fi)))
+        (prev (and (fsp-previous-live-p fi now) (fsp-initiator-previous-session fi))))
     (flet ((try (session)
              (and session
                   (handler-case (multiple-value-list (fsp-open-data session wire))
@@ -367,8 +400,12 @@
                 (fsp-initiator-session fi) pend
                 (fsp-initiator-pending-session fi) nil
                 (fsp-initiator-k fi) t)
+          (fsp-begin-drain fi now)
           (return-from fsp-open-any (values-list opened))))
       (let ((opened (try prev)))
-        (when opened (return-from fsp-open-any (values-list opened))))
+        (when opened
+          ;; a straggler in the old epoch keeps its drain open
+          (setf (fsp-initiator-previous-last-used-ms fi) now)
+          (return-from fsp-open-any (values-list opened))))
       ;; nothing opened: report the failure the way FSP-OPEN-DATA does
       (fsp-open-data cur wire))))
