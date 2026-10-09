@@ -143,9 +143,32 @@
              (handler-case (progn (fsp-handle-ack fi (subseq from-stranger 1)) nil)
                (error () t))))))
 
+(defun test-fsp-cp-frames ()
+  "A CP-flagged frame: coordinates sit between the header and the ciphertext."
+  (multiple-value-bind (fi rh init-session resp-session) (fsp-handshake-pair)
+    (declare (ignore fi rh))
+    (let* ((src (list (fsp-addr 10) (fsp-addr 20)))
+           (dst (list (fsp-addr 30)))
+           (wire (fsp-seal-data resp-session 0 3 (ascii-octets "with coords") 7
+                                :coords (list src dst))))
+      (check "a CP frame sets bit 0 of the flags byte" (logtest (aref wire 1) 1))
+      (check "a CP frame carries both coordinates before the ciphertext"
+             (= (decode-u16le wire 12) 2))
+      (multiple-value-bind (mt sp dp data ts) (fsp-open-data init-session wire)
+        (check "a CP DataPacket opens with its coordinates skipped"
+               (and (= mt #x10) (= sp 0) (= dp 3) (= ts 7)
+                    (equalp data (ascii-octets "with coords")))))
+      ;; N: the CP bit set on a frame with no coordinates must not open
+      (let ((bad (copy-seq wire)))
+        (setf (aref bad 12) 9 (aref bad 13) 0)
+        (check "a CP frame with a corrupt coordinate count is refused"
+               (handler-case (progn (fsp-open-data init-session bad) nil)
+                 (error () t)))))))
+
 (defun test-fsp ()
   (test-session-datagram)
   (test-coords)
   (test-fsp-bodies)
   (test-fsp-handshake-and-data)
+  (test-fsp-cp-frames)
   (test-fsp-wrong-peer))

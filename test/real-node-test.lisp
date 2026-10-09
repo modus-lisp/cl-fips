@@ -198,11 +198,21 @@
                             (out "~6d FSP SessionAck received; SessionMsg3 sent; session established"
                                  (- (ms) t0))))
                          ((zerop (cl-fips:prefix-phase payload))
-                          (multiple-value-bind (mt sp dp data) (cl-fips:fsp-open-data
-                                                                (cl-fips:fsp-initiator-session fsp)
-                                                                payload)
+                          (multiple-value-bind (mt sp dp data)
+                              (handler-case
+                                  (cl-fips:fsp-open-data (cl-fips:fsp-initiator-session fsp) payload)
+                                (error (e)
+                                  (multiple-value-bind (fl plen ctr) (cl-fips:decode-fsp-header payload)
+                                    (out "~6d FSP frame did not open: flags=~d payload_len=~d counter=~d (~a)"
+                                         (- (ms) t0) fl plen ctr e))
+                                  (values nil nil nil nil)))
                             (declare (ignore dp))
                             (cond
+                              ((null mt) nil)           ; logged above: the frame did not open
+                              ((and (= mt #x10) (/= sp 4600))
+                               ;; a DataPacket the node initiated (its native flow to us)
+                               (out "~6d FSP DataPacket from the node src_port=~d dst_port=~d data=~s"
+                                    (- (ms) t0) sp dp (map 'string #'code-char data)))
                               ((and (= mt #x10) (= sp 4600))
                                (if (and last-probe (equalp data last-probe))
                                    (out "~6d FSP echo OK: the node returned our ~d bytes from port 4600"

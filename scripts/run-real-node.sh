@@ -146,11 +146,24 @@ node_yaml "$DIR/dial.yaml" "$P"
 NP=$!
 i=0; until grep -q "TCP accept loop starting" "$DIR/node-dial.log" || [ $i -ge 50 ]; do sleep 0.2; i=$((i+1)); done
 start_echo dial
+# node-initiated data: once the session is up, a local client opens a flow from the
+# node to our npub (port 4700) and sends one datagram; it reaches us over the session
+SEND_BIN="${SEND_BIN:-$(dirname "$FIPS_BIN")/examples/native-send}"
+if [ -x "$SEND_BIN" ] && [ "${CL_FIPS_NODE_SEND:-on}" != "off" ]; then
+  ( i=0; until grep -q "Session established" "$DIR/node-dial.log" 2>/dev/null || [ $i -ge 150 ]; do sleep 0.2; i=$((i+1)); done
+    sleep 3
+    "$SEND_BIN" "$DIR/api.sock" "$(cat "$DIR/lisp.npub")" 4700 "from-node-hello" > "$DIR/send.log" 2>&1 ) &
+fi
 echo "== dial (node on 127.0.0.1:$P)"
 timeout $((SECS + 60)) $LISP dial "$DIR" "$P" "$SECS" > "$DIR/lisp-dial.log" 2>&1 || fail=1
 sleep 1; kill $NP 2>/dev/null; wait $NP 2>/dev/null; [ -n "$EP" ] && kill $EP 2>/dev/null; EP=""
 grep -E "HANDSHAKE|msg_types|remote static|PASS|FAIL" "$DIR/lisp-dial.log" | sed 's/^/  /'
 check_echo "$DIR/lisp-dial.log"
+if [ -x "$SEND_BIN" ] && [ "${CL_FIPS_NODE_SEND:-on}" != "off" ]; then
+  if grep -q 'FSP DataPacket from the node src_port=.* dst_port=4700 data="from-node-hello"' "$DIR/lisp-dial.log"; then
+    echo "  node-initiated: the node's flow reached us, byte for byte (port 4700)"
+  else echo "  FAIL: no node-initiated DataPacket reached us on port 4700"; fail=1; fi
+fi
 check_node_log dial "$DIR/node-dial.log"
 
 # --- accept: node initiator -> Lisp ------------------------------------------------

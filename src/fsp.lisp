@@ -102,16 +102,37 @@
 
 ;;; --- Established frames -------------------------------------------------------
 
-(defun fsp-seal-data (session src-port dst-port data timestamp-ms)
-  "An established FSP frame carrying a DataPacket.  Returns the wire bytes."
+(defconstant +fsp-flag-cp+ #x01 "Coords Present: cleartext coordinates follow the header.")
+
+(defun fsp-seal-data (session src-port dst-port data timestamp-ms &key coords)
+  "An established FSP frame carrying a DataPacket.  COORDS, when given, is
+   (src-addrs dest-addrs) and sets CP: the two cleartext coordinates sit between
+   the header and the ciphertext, and are not part of the AAD.  Returns the wire
+   bytes."
   (let* ((inner (bytes-cat (encode-u32le timestamp-ms)
                            (bytes-of +fsp-data-packet-msg-type+ 0)
                            (encode-u16le src-port) (encode-u16le dst-port)
                            data))
          (counter (natrium.noise:session-current-send-counter session))
-         (header (encode-fsp-header 0 (length inner) counter))
-         (ct (natrium.noise:session-encrypt-with-aad session inner header)))
-    (bytes-cat header ct)))
+         (flags (if coords +fsp-flag-cp+ 0))
+         (header (encode-fsp-header flags (length inner) counter))
+         (ct (natrium.noise:session-encrypt-with-aad session inner header))
+         (cleartext (if coords
+                        (bytes-cat (encode-coords (first coords))
+                                   (encode-coords (second coords)))
+                        (bytes-of))))
+    (bytes-cat header cleartext ct)))
+
+(defun fsp-skip-coords (wire offset)
+  "The offset just past two cleartext coordinates starting at OFFSET.  A zero
+   count is an absent coordinate, as upstream's decode_optional_coords reads it."
+  (dotimes (i 2 offset)
+    (when (> (+ offset 2) (length wire))
+      (error 'natrium.noise:noise-error :reason "CP coordinates truncated"))
+    (let ((count (decode-u16le wire offset)))
+      (incf offset (+ 2 (* 16 count)))
+      (when (> offset (length wire))
+        (error 'natrium.noise:noise-error :reason "CP coordinates truncated")))))
 
 (defun fsp-open-data (session wire)
   "Open an established FSP frame.  Returns (values msg-type src-port dst-port data
@@ -123,7 +144,10 @@
   (multiple-value-bind (flags payload-len counter) (decode-fsp-header wire)
     (declare (ignore flags))
     (let* ((header (bytes-slice wire 0 +fsp-header-size+))
-           (ct (bytes-slice wire +fsp-header-size+))
+           (ct-start (if (logtest (aref wire 1) +fsp-flag-cp+)
+                         (fsp-skip-coords wire +fsp-header-size+)
+                         +fsp-header-size+))
+           (ct (bytes-slice wire ct-start))
            (inner (natrium.noise:session-decrypt-with-replay-check session counter ct header)))
       (unless (= (length inner) payload-len)
         (error 'natrium.noise:noise-error :reason "FSP payload length does not match"))
