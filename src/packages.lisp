@@ -75,6 +75,7 @@
            ;; FMP over a byte stream (link.lisp)
            #:+default-stream-mtu+ #:link-error #:link-error-reason #:link-error-detail
            #:link-error-fatal-p #:make-byte-port #:byte-port-close #:byte-port-closed
+           #:make-datagram-port #:datagram-port-p #:+fsp-data-overhead+ #:+handshake-timeout-ms+
            #:fmp-packet-remaining #:read-fmp-packet #:write-fmp-packet #:deadline-after-ms
            #:stream-link #:stream-link-initiate #:stream-link-accept
            #:stream-link-send #:stream-link-receive #:stream-link-close

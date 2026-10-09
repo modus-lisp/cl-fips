@@ -15,7 +15,10 @@
 (defpackage #:cl-fips.transport
   (:use #:common-lisp)
   (:export #:tcp-connect #:tcp-listen #:tcp-listener-port #:tcp-accept #:tcp-listener-close
-           #:socket-byte-port))
+           #:socket-byte-port
+           #:+udp-mtu+ #:udp-open #:udp-close #:udp-endpoint-local-port #:udp-pump
+           #:udp-peer-port #:udp-accept #:udp-port-ready-p #:udp-accept-pending-p
+           #:udp-endpoint-received #:udp-endpoint-dropped))
 
 (in-package #:cl-fips.transport)
 

@@ -140,7 +140,27 @@
         (check "N3: the same session under the key's own address is accepted"
                (eq (attempt kc (node-addr (keypair-public-bytes kc))) :accepted))))))
 
+(defun test-node-dead-link ()
+  "N8: a link silent for 30 s is removed; one that keeps hearing its peer is not."
+  (let* ((a (new-test-node)) (b (new-test-node))
+         (eps (connect-nodes a b)))
+    (settle (list a b) eps 0)
+    ;; both sides keep talking: heartbeats every 5 s are delivered
+    (loop for now from 1000 to 61000 by 1000 do (tick-all (list a b) now) (pump eps now))
+    (check "N8: a link that is heard from stays up past the dead timeout"
+           (= (length (fips-node-links a)) 1))
+    ;; B goes silent: A ticks, nothing is delivered
+    (let* ((heard (gethash (second (first eps)) (cl-fips::fips-node-last-heard a)))
+           (events (loop for now from 62000 to (+ heard 30000) by 1000 append (node-tick a now))))
+      (check "N8: A last heard B during the exchange" (<= 60000 heard 61000))
+      (check "N8: ... it is not removed at 30 s of silence" (= (length (fips-node-links a)) 1))
+      (setf events (append events (node-tick a (+ heard 30001))))
+      (check "N8: it is removed just past 30 s of silence, as :dead"
+             (and (null (fips-node-links a)) (has-event events :link-closed :dead)))
+      (check "N8: the dead peer left A's tree" (null (node-peer-coords a (fips-node-own b)))))))
+
 (defun test-node ()
+  (test-node-dead-link)
   (test-node-two)
   (test-node-transit)
   (test-node-queued-open)

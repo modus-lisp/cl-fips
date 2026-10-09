@@ -17,7 +17,8 @@
 ;;;;   (:link-event EVENT LINK)        a link rekey packet (:rekey-answered ...)
 ;;;;   (:link-action ACTION LINK)      a link rekey action from the tick (:cutover ...)
 ;;;;   (:link-drop REASON LINK)        a non-fatal link error: the frame was dropped
-;;;;   (:link-closed REASON LINK)      a fatal link error: the link is gone
+;;;;   (:link-closed REASON LINK)      a fatal link error, or :dead (silent too long):
+;;;                                   the link is gone
 ;;;;   (:forwarded DEST TTL LINK)      a SessionDatagram forwarded out of LINK
 ;;;;   (:dropped REASON DEST)          a transit datagram not forwarded
 ;;;;   (:established PEER)             our session with PEER completed its handshake
@@ -37,6 +38,10 @@
 (in-package #:cl-fips)
 
 (defconstant +node-heartbeat-ms+ 5000)
+(defconstant +link-dead-ms+ 30000
+  "link_dead_timeout_secs: a link we have heard nothing authentic on for this long
+   is removed.  On TCP the peer's close usually comes first; on UDP this is the only
+   way to learn that a peer has gone.")
 (defconstant +fsp-data-overhead+ 110
   "Bytes of framing around a DataPacket's data on a stream link: the FMP header
    and tag, the inner timestamp, the SessionDatagram header, the FSP header and
@@ -52,6 +57,8 @@
   (links '())                                   ; stream links, oldest first
   (sessions (make-hash-table :test 'equalp))    ; peer node_addr -> FSP-INITIATOR
   (heartbeat-due (make-hash-table :test 'eq))   ; link -> ms
+  (last-heard (make-hash-table :test 'eq))      ; link -> ms of its last authentic packet
+  (dead-ms +link-dead-ms+)                      ; NIL: never reap a silent link
   (forwarded 0) (no-route 0) (ttl-expired 0) (too-big 0) (malformed 0))
 
 (defun make-fips-node (static)
@@ -88,6 +95,7 @@
   (handler-case (stream-link-close link) (error () nil))
   (setf (fips-node-links node) (remove link (fips-node-links node)))
   (remhash link (fips-node-heartbeat-due node))
+  (remhash link (fips-node-last-heard node))
   (%node-mark-tree-dirty node))
 
 (defun node-route (node dest &optional from-link)
@@ -168,6 +176,13 @@
   "Heartbeats, each link's poll (rekey, MMP, routing announces), and resends of
    unanswered SessionSetups.  Returns events."
   (let ((events '()))
+    ;; a link silent for the dead timeout is gone (its first tick starts its clock)
+    (dolist (link (fips-node-links node))
+      (let ((heard (or (gethash link (fips-node-last-heard node))
+                       (setf (gethash link (fips-node-last-heard node)) now))))
+        (when (and (fips-node-dead-ms node) (> (- now heard) (fips-node-dead-ms node)))
+          (node-remove-link node link)
+          (push (list :link-closed :dead link) events))))
     (dolist (link (fips-node-links node))
       (let ((due (gethash link (fips-node-heartbeat-due node) 0)))
         (when (>= now due)
@@ -202,6 +217,9 @@
   (handler-case
       (multiple-value-bind (m ev flags counter slot) (stream-link-receive link :timeout-ms timeout-ms)
         (declare (ignore flags counter))
+        ;; anything that authenticated (a frame, or a handshake packet the link
+        ;; took) shows the peer is alive; a dropped packet does not
+        (setf (gethash link (fips-node-last-heard node)) now)
         (cond
           ((null m) (list (list :link-event ev link)))
           ((zerop (length m)) nil)

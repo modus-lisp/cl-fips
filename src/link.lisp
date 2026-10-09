@@ -44,7 +44,21 @@
                      (link-error-reason c) (link-error-detail c) (link-error-fatal-p c)))))
 
 (defstruct (byte-port (:constructor make-byte-port (read-exactly write-all &optional close-fn)))
-  read-exactly write-all close-fn (closed nil))
+  read-exactly write-all close-fn (closed nil)
+  ;; a DATAGRAM port (UDP) delivers whole packets instead of a byte stream:
+  ;;   (read-packet DEADLINE) -> (values OCTETS STATUS), STATUS :ok | :timeout | :eof
+  ;; One datagram is one FMP packet, with no stream framing around it.
+  (read-packet nil))
+
+(defun make-datagram-port (read-packet write-all &optional close-fn)
+  "A port over a datagram transport.  READ-PACKET returns one whole datagram; WRITE-ALL
+   sends OCTETS as one datagram.  On such a port a malformed packet or a read timeout
+   drops nothing but that packet: there is no stream to lose sync with."
+  (let ((p (make-byte-port nil write-all close-fn)))
+    (setf (byte-port-read-packet p) read-packet)
+    p))
+
+(defun datagram-port-p (port) (and (byte-port-read-packet port) t))
 
 (defun byte-port-close (port)
   (unless (byte-port-closed port)
@@ -105,11 +119,35 @@
                            (format nil "stream ended inside a packet (~d of ~d bytes)"
                                    (length octets) n)))))))
 
+(defun %read-datagram-packet (port mtu deadline)
+  "One datagram, checked as the stream rule would check it: the prefix's length must
+   account for exactly the bytes that arrived.  Failures are NON-fatal (the datagram
+   is dropped), except :peer-closed, which means the port itself was closed."
+  (multiple-value-bind (octets status) (funcall (byte-port-read-packet port) deadline)
+    (ecase status
+      (:ok
+       (when (< (length octets) +stream-prefix-size+)
+         (link-fail port :truncated (format nil "~d-byte datagram" (length octets)) nil))
+       (multiple-value-bind (remaining reason detail) (fmp-packet-remaining octets mtu)
+         (cond ((null remaining) (link-fail port reason detail nil))
+               ((/= (length octets) (+ +stream-prefix-size+ remaining))
+                (link-fail port :length-mismatch
+                           (format nil "~d-byte datagram, its prefix says ~d"
+                                   (length octets) (+ +stream-prefix-size+ remaining))
+                           nil))
+               (t octets))))
+      (:timeout (link-fail port :timeout "no datagram within the read deadline" nil))
+      (:eof (link-fail port :peer-closed "the datagram port was closed")))))
+
 (defun read-fmp-packet (port &key (mtu +default-stream-mtu+) timeout-ms)
   "Read one whole FMP packet (prefix included) from PORT.  TIMEOUT-MS bounds the
-   complete packet.  Every failure is a fatal LINK-ERROR and closes PORT:
-   :peer-closed (EOF between packets), :truncated (EOF inside one), :timeout,
-   :unknown-version, :unknown-phase, :handshake-size-mismatch, :payload-too-large."
+   complete packet.  On a stream port every failure is a fatal LINK-ERROR and closes
+   PORT: :peer-closed (EOF between packets), :truncated (EOF inside one), :timeout,
+   :unknown-version, :unknown-phase, :handshake-size-mismatch, :payload-too-large.
+   On a datagram port they are non-fatal and drop the one datagram."
+  (when (datagram-port-p port)
+    (return-from read-fmp-packet
+      (%read-datagram-packet port mtu (deadline-after-ms timeout-ms))))
   (let* ((deadline (deadline-after-ms timeout-ms))
          (prefix (%port-read port +stream-prefix-size+ deadline t)))
     (multiple-value-bind (remaining reason detail) (fmp-packet-remaining prefix mtu)
@@ -202,25 +240,66 @@
      :mmp (%make-mmp reports)
      :mtu mtu :timeout-ms timeout-ms :started (get-internal-real-time))))
 
+(defconstant +msg1-first-resend-ms+ 1000
+  "handshake_resend_interval_ms; the interval doubles, so resends go at about
+   t+1, t+3, t+7, t+15 s (handshake.rs).")
+(defconstant +handshake-timeout-ms+ 30000 "handshake_timeout_secs.")
+
+(defun %await-msg2 (port hs msg1 our-index mtu timeout-ms)
+  "On a datagram port: wait for the msg2 that answers MSG1, resending MSG1 on the
+   doubling schedule, until TIMEOUT-MS (default 30 s) has passed.  Datagrams that are
+   not that answer -- malformed, another phase, another index, or a msg2 that does
+   not authenticate -- are dropped and the wait goes on.  Returns the peer's index."
+  (let* ((total (or timeout-ms +handshake-timeout-ms+))
+         (give-up (deadline-after-ms total))
+         (resend-in +msg1-first-resend-ms+)
+         (next (deadline-after-ms resend-in)))
+    (loop
+      (let* ((now (get-internal-real-time))
+             (wait (ceiling (* 1000 (max 0 (- (min next give-up) now)))
+                            internal-time-units-per-second))
+             (packet (handler-case (read-fmp-packet port :mtu mtu :timeout-ms wait)
+                       (link-error (e)
+                         (when (link-error-fatal-p e) (error e))
+                         nil))))
+        (when packet
+          (multiple-value-bind (their-index receiver-index noise-msg2) (parse-msg2 packet)
+            (when (and their-index (= receiver-index our-index)
+                       (ignore-errors (natrium.noise:ik-try-read-message-2 hs noise-msg2) t))
+              (return their-index))))
+        (let ((now (get-internal-real-time)))
+          (when (>= now give-up)
+            (link-fail port :timeout "no msg2 answered our msg1"))
+          (when (>= now next)
+            (write-fmp-packet port msg1)
+            (setf resend-in (* 2 resend-in)
+                  next (+ now (ceiling (* resend-in internal-time-units-per-second) 1000)))))))))
+
 (defun stream-link-initiate (port static remote-static-bytes local-epoch
                              &key (our-index (random-session-index))
                                (mtu +default-stream-mtu+) timeout-ms
                                rekey-config jitter-fn (reports t) routing)
   "IK initiator on PORT: write msg1, read msg2.  Returns an established STREAM-LINK.
    REKEY-CONFIG / JITTER-FN configure the rekey machine (stock: 120 s, no
-   jitter); REPORTS selects the MMP reports STREAM-LINK-POLL emits."
-  (let* ((hs (fips-make-ik-initiator static remote-static-bytes local-epoch)))
-    (write-fmp-packet port (build-msg1 our-index (natrium.noise:ik-write-message-1 hs)))
-    (let ((packet (%handshake-packet port +phase-msg2+ mtu timeout-ms)))
-      (multiple-value-bind (their-index receiver-index noise-msg2) (parse-msg2 packet)
-        (unless their-index (link-fail port :handshake-failed "malformed msg2"))
-        (unless (= receiver-index our-index)
-          (link-fail port :wrong-receiver-index
-                     (format nil "msg2 names index ~d, ours is ~d" receiver-index our-index)))
-        (%noise-or-fail (port :handshake-failed)
-          (natrium.noise:ik-read-message-2 hs noise-msg2))
-        (%finish-link port :initiator hs our-index their-index mtu timeout-ms
-                      static local-epoch rekey-config jitter-fn reports routing)))))
+   jitter); REPORTS selects the MMP reports STREAM-LINK-POLL emits.  On a datagram
+   port msg1 is resent until it is answered or TIMEOUT-MS (default 30 s) passes."
+  (let* ((hs (fips-make-ik-initiator static remote-static-bytes local-epoch))
+         (msg1 (build-msg1 our-index (natrium.noise:ik-write-message-1 hs))))
+    (write-fmp-packet port msg1)
+    (if (datagram-port-p port)
+        (let ((their-index (%await-msg2 port hs msg1 our-index mtu timeout-ms)))
+          (%finish-link port :initiator hs our-index their-index mtu timeout-ms
+                        static local-epoch rekey-config jitter-fn reports routing))
+        (let ((packet (%handshake-packet port +phase-msg2+ mtu timeout-ms)))
+          (multiple-value-bind (their-index receiver-index noise-msg2) (parse-msg2 packet)
+            (unless their-index (link-fail port :handshake-failed "malformed msg2"))
+            (unless (= receiver-index our-index)
+              (link-fail port :wrong-receiver-index
+                         (format nil "msg2 names index ~d, ours is ~d" receiver-index our-index)))
+            (%noise-or-fail (port :handshake-failed)
+              (natrium.noise:ik-read-message-2 hs noise-msg2))
+            (%finish-link port :initiator hs our-index their-index mtu timeout-ms
+                          static local-epoch rekey-config jitter-fn reports routing))))))
 
 (defun stream-link-accept (port static local-epoch
                            &key (our-index (random-session-index))
@@ -233,10 +312,14 @@
       (unless their-index (link-fail port :handshake-failed "malformed msg1"))
       (%noise-or-fail (port :handshake-failed)
         (natrium.noise:ik-read-message-1 hs noise-msg1))
-      (let ((noise-msg2 (natrium.noise:ik-write-message-2 hs)))
-        (write-fmp-packet port (build-msg2 our-index their-index noise-msg2))
-        (%finish-link port :responder hs our-index their-index mtu timeout-ms
-                      static local-epoch rekey-config jitter-fn reports routing)))))
+      (let* ((noise-msg2 (natrium.noise:ik-write-message-2 hs))
+             (msg2 (build-msg2 our-index their-index noise-msg2)))
+        (write-fmp-packet port msg2)
+        (let ((link (%finish-link port :responder hs our-index their-index mtu timeout-ms
+                                  static local-epoch rekey-config jitter-fn reports routing)))
+          ;; kept so a resent msg1 (our msg2 lost on a datagram transport) is answered
+          (setf (link-setup-answer (stream-link-fmp link)) (cons (%msg1-digest packet) msg2))
+          link)))))
 
 (defun stream-link-elapsed-ms (link)
   (floor (* 1000 (- (get-internal-real-time) (stream-link-started link)))

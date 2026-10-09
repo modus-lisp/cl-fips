@@ -74,6 +74,8 @@
 (defconstant +rekey-jitter-secs+ 15 "node/mod.rs REKEY_JITTER_SECS.")
 (defconstant +ended-msg1-record+ 256 "proto/fmp/core.rs ENDED_MSG1_RECORD.")
 (defconstant +msg1-wire-size+ 114)
+(defconstant +setup-resend-window-ms+ 30000
+  "handshake_timeout_secs: how long a resend of the establishing msg1 is answered.")
 (defconstant +msg2-wire-size+ 69)
 
 (defstruct rekey-config
@@ -153,7 +155,11 @@
   ;; initiator cycle in flight
   rekey-handshake rekey-our-index rekey-msg1 (rekey-in-progress nil)
   ;; responder bookkeeping
-  last-peer-rekey held-answer (ended-msg1s nil))
+  last-peer-rekey held-answer (ended-msg1s nil)
+  ;; the responder's answer to the msg1 this link was established from, as
+  ;; (digest . msg2-wire): a datagram transport can lose our msg2, and the
+  ;; initiator then resends the same msg1 (handshake.rs ResendMsg2)
+  (setup-answer nil))
 
 (defun make-link (session our-index their-index &key static peer-static-bytes local-epoch
                                                     remote-epoch now-ms allocate-index
@@ -390,6 +396,14 @@
    same-identity arm, then the RekeyRespond effects."
   (multiple-value-bind (sender-idx noise) (parse-msg1 wire)
     (unless sender-idx (return-from %receive-msg1 (values :drop :malformed)))
+    ;; a resend of the msg1 this link came from: our msg2 was lost, so answer it
+    ;; again (no crypto, no state).  After the handshake window it is only a replay.
+    (let ((setup (link-setup-answer link)))
+      (when (and setup (equalp (car setup) (%msg1-digest wire)))
+        (return-from %receive-msg1
+          (if (< (- now-ms (link-link-established-at link)) +setup-resend-window-ms+)
+              (values :msg2 (cdr setup))
+              (values :drop :answered-before)))))
     (let ((hs (fips-make-ik-responder (link-static link) (link-local-epoch link)))
           (digest (%msg1-digest wire)))
       (unless (ignore-errors (natrium.noise:ik-read-message-1 hs noise) t)

@@ -50,11 +50,11 @@
 ;;; The socket adapter.  Development-only: usocket on SBCL.  Nothing in src/
 ;;; depends on it; it only supplies the two closures of a BYTE-PORT.
 (defsystem "cl-fips/transport"
-  :description "TCP adapter for cl-fips stream links (usocket; SBCL development use)."
+  :description "TCP and UDP adapters for cl-fips links (usocket; SBCL development use)."
   :depends-on ("cl-fips" "usocket")
-  :components ((:module "transport" :components ((:file "tcp")))))
+  :components ((:module "transport" :serial t :components ((:file "tcp") (:file "udp")))))
 
 (defsystem "cl-fips/transport-test"
   :description "FMP over real TCP against the upstream Rust oracle."
   :depends-on ("cl-fips/test" "cl-fips/transport")
-  :components ((:module "test" :components ((:file "tcp-test")))))
+  :components ((:module "test" :serial t :components ((:file "tcp-test") (:file "udp-test")))))
