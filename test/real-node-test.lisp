@@ -123,6 +123,14 @@
           do (setf (aref out i) (+ 97 (mod (+ i n) 26))))
     out))
 
+(defun rekey-at-seconds ()
+  "CL_FIPS_FSP_REKEY_AT: seconds into the exchange at which we start an FSP
+   rekey (default 60; \"off\" = never)."
+  (let ((v (sb-ext:posix-getenv "CL_FIPS_FSP_REKEY_AT")))
+    (cond ((equal v "off") nil)
+          ((and v (plusp (length v))) (parse-integer v))
+          (t 60))))
+
 (defun echo-enabled-p ()
   "CL_FIPS_ECHO: unset or \"on\" = probe the node's native-echo on port 4600
    (the default); \"off\" = probe the IPv6 shim on port 256."
@@ -146,6 +154,7 @@
   (let* ((t0 (ms)) (deadline (+ t0 (* 1000 secs))) (next-hb 0) (seen '())
          (last-frame-log 0)
          (fsp nil) (next-data 0) (data-count 0) (last-probe nil)
+         (rekey-at (rekey-at-seconds)) (rekey-started nil)
          (node-addr (cl-fips:node-addr node-pub))
          (our-addr (cl-fips:node-addr (secp256k1-fast.ecdh:keypair-public-bytes static))))
     (loop while (< (ms) deadline) do
@@ -166,6 +175,13 @@
             (let ((d (cl-fips:fsp-setup-datagram fsp)))
               (cl-fips:stream-link-send link d)
               (out "~6d FSP SessionSetup sent to the node (XK msg1)" (- (ms) t0))))))
+      ;; we start the FSP rekey once, after REKEY-AT seconds
+      (when (and fsp rekey-at (not rekey-started)
+                 (eq (cl-fips:fsp-initiator-phase fsp) :established)
+                 (>= (- (ms) t0) (* 1000 rekey-at)))
+        (setf rekey-started t)
+        (cl-fips:stream-link-send link (cl-fips:fsp-start-rekey fsp))
+        (out "~6d FSP rekey: SessionSetup sent (ours)" (- (ms) t0)))
       (when (and fsp (eq (cl-fips:fsp-initiator-phase fsp) :established) (>= (ms) next-data))
         (incf data-count)
         ;; CL_FIPS_ECHO=on (default): the probe goes to port 4600, which the node's
@@ -173,6 +189,8 @@
         ;; shim (256) decrypts and rejects them.
         (let* ((payload (probe-payload data-count))
                (port (if (echo-enabled-p) 4600 256))
+               ;; building the datagram is what cuts over a rekey we started
+               (cutting (cl-fips::fsp-initiator-rekey-initiator-p fsp))
                (d (cl-fips:fsp-data-datagram fsp payload :dst-port port
                                                          :timestamp-ms (ldb (byte 32 0) (- (ms) t0)))))
           ;; a DataPacket is 110 bytes of framing around its data on the link (FMP
@@ -186,6 +204,8 @@
               (t
                (setf last-probe payload)
                (cl-fips:stream-link-send link d)
+               (when (and cutting (not (cl-fips::fsp-initiator-rekey-initiator-p fsp)))
+                 (out "~6d FSP rekey cutover (ours): the new session is current, K set" (- (ms) t0)))
                (out "~6d FSP DataPacket ~d sent (dst_port ~d)" (- (ms) t0) data-count port)))))
         (setf next-data (+ (ms) 5000)))
       (multiple-value-bind (actions reports) (cl-fips:stream-link-poll link)
@@ -214,6 +234,10 @@
                  (handler-case
                      (let ((payload (nth-value 4 (cl-fips:decode-session-datagram (subseq m 1)))))
                        (cond
+                         ((and (= (cl-fips:prefix-phase payload) 2) (cl-fips::fsp-initiator-rekey-hs fsp))
+                          (let ((reply (cl-fips:fsp-handle-rekey-ack fsp (subseq m 1))))
+                            (cl-fips:stream-link-send link reply)
+                            (out "~6d FSP rekey: SessionAck handled; SessionMsg3 sent" (- (ms) t0))))
                          ((eq (cl-fips:fsp-initiator-phase fsp) :setup-sent)
                           (let ((reply (cl-fips:fsp-handle-ack fsp (subseq m 1))))
                             (cl-fips:stream-link-send link reply)

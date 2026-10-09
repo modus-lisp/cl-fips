@@ -176,6 +176,60 @@
   "The SessionAck payload inside a SessionDatagram link message (msg_type first)."
   (nth-value 4 (decode-session-datagram (subseq ack-link-message 1))))
 
+(defun fsp-keyed-session ()
+  "An established initial session, with the keys: returns (values fi ka kb a b
+   the peer's side of the session)."
+  (let* ((ka (generate-keypair)) (kb (generate-keypair))
+         (a (fsp-addr 10)) (b (fsp-addr 20))
+         (fi (make-fsp-initiator ka (keypair-public-bytes kb) (octets 1 1 1 1 1 1 1 1)
+                                 a b (list a) (list b)))
+         (rh (fips-make-xk-responder kb (octets 2 2 2 2 2 2 2 2))))
+    (let* ((d1 (fsp-setup-datagram fi))
+           (setup-payload (nth-value 4 (decode-session-datagram (subseq d1 1)))))
+      (natrium.noise:xk-read-message-1 rh (nth-value 4 (decode-fsp-setup-or-ack setup-payload))))
+    (let* ((m2 (natrium.noise:xk-write-message-2 rh))
+           (d3 (fsp-handle-ack fi (subseq (encode-session-datagram b a (encode-fsp-setup-or-ack 2 0 (list b) (list a) m2)) 1))))
+      (natrium.noise:xk-read-message-3 rh (decode-fsp-msg3 (nth-value 4 (decode-session-datagram (subseq d3 1))))))
+    (values fi ka kb a b (natrium.noise:handshake-into-session rh))))
+
+(defun test-fsp-own-rekey ()
+  "We start the rekey: SessionSetup out, the peer's SessionAck in, our SessionMsg3
+   out.  Our first frame under the new session carries K and cuts over."
+  (multiple-value-bind (fi ka kb a b rs-old) (fsp-keyed-session)
+    (let* ((old-cur (fsp-initiator-session fi))
+           (setup (fsp-start-rekey fi))
+           (rr (fips-make-xk-responder kb (octets 4 4 4 4 4 4 4 4))))
+      (check "a rekey starts with a SessionSetup (phase 1)"
+             (= (prefix-phase (nth-value 4 (decode-session-datagram (subseq setup 1)))) 1))
+      (natrium.noise:xk-read-message-1 rr (nth-value 4 (decode-fsp-setup-or-ack
+                                                       (nth-value 4 (decode-session-datagram (subseq setup 1))))))
+      (let* ((m2 (natrium.noise:xk-write-message-2 rr))
+             (ack (encode-session-datagram b a (encode-fsp-setup-or-ack 2 0 (list b) (list a) m2)))
+             (msg3d (fsp-handle-rekey-ack fi (subseq ack 1)))
+             (msg3-payload (nth-value 4 (decode-session-datagram (subseq msg3d 1)))))
+        (check "the SessionAck is answered with a SessionMsg3 (phase 3)"
+               (= (prefix-phase msg3-payload) 3))
+        (natrium.noise:xk-read-message-3 rr (decode-fsp-msg3 msg3-payload))
+        (let* ((rs-new (natrium.noise:handshake-into-session rr))
+               (d (fsp-data-datagram fi (ascii-octets "our rekeyed") :dst-port 3))
+               (wire (subseq d 36)))
+          (check "our first frame under a rekey sets the K bit" (logtest (aref wire 1) 2))
+          (check "our first frame opens under the peer's rekeyed session"
+                 (equalp (nth-value 3 (fsp-open-data rs-new wire)) (ascii-octets "our rekeyed")))
+          (check "our first frame cut over: the new session is current, the old one kept"
+                 (and (not (eq (fsp-initiator-session fi) old-cur))
+                      (eq (fsp-initiator-previous-session fi) old-cur)
+                      (null (fsp-initiator-pending-session fi))))
+          (check "a frame from the peer under the rekeyed session opens at our end"
+                 (equalp (nth-value 3 (fsp-open-any fi (fsp-seal-data rs-new 0 3 (ascii-octets "peer") 5 :k t)))
+                         (ascii-octets "peer")))
+          (check "a late frame under the replaced session still opens during the drain"
+                 (equalp (nth-value 3 (fsp-open-any fi (fsp-seal-data rs-old 0 3 (ascii-octets "late") 6)))
+                         (ascii-octets "late")))
+          (check "a second rekey cannot start while one is in flight"
+                 (handler-case (progn (fsp-start-rekey fi) (fsp-start-rekey fi) nil)
+                   (error () t))))))))
+
 (defun test-fsp-rekey ()
   "The node rekeys the established session; we answer as responder, adopt the new
    session on its first authenticated frame, and keep the old one for late frames."
@@ -208,6 +262,8 @@
                (msg3 (encode-session-datagram b a (encode-fsp-msg3 m3))))
           (check "the rekey SessionMsg3 is taken"
                  (fsp-handle-rekey-msg3 fi (subseq msg3 1)))
+          (check "a resent msg3 is a no-op, not an error"
+                 (eq (fsp-handle-rekey-msg3 fi (subseq msg3 1)) :duplicate))
           (let* ((ns (natrium.noise:handshake-into-session nh))
                  (new-frame (fsp-seal-data ns 0 3 (ascii-octets "new epoch") 2 :k t)))
             (check "a frame under the rekeyed session does not open under the old one"
@@ -240,4 +296,5 @@
   (test-fsp-handshake-and-data)
   (test-fsp-cp-frames)
   (test-fsp-rekey)
+  (test-fsp-own-rekey)
   (test-fsp-wrong-peer))

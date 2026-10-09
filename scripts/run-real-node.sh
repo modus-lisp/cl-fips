@@ -116,6 +116,14 @@ check_node_log() {  # $1 arm, $2 log
       else echo "  FAIL: node decrypted no DataPacket from Lisp"; fail=1; fi
     fi
   fi
+  # Our FSP rekey (started at CL_FIPS_FSP_REKEY_AT, default 60 s): the node must
+  # complete it as responder and promote the new session when our first frame
+  # under it authenticates.  Only checked on runs long enough to reach it.
+  if [ "${CL_FIPS_FSP_REKEY_AT:-60}" != "off" ] && [ "$SECS" -ge 90 ] && [ "${CL_FIPS_FSP:-on}" != "off" ]; then
+    if grep -q "FSP rekey: completed XK as responder" "$2" && grep -q "FSP rekey cutover complete, promoting new session" "$2"; then
+      echo "  node: completed our FSP rekey and promoted the new session"
+    else echo "  FAIL: node did not complete our FSP rekey"; fail=1; fi
+  fi
   if grep -qE "Removing peer|Peer removed" "$2"; then echo "  FAIL: node removed the peer"; fail=1
   else echo "  node: never removed the peer"; fi
   if grep -q "FMP rekey aborted" "$2"; then echo "  FAIL: node aborted an FMP rekey"; fail=1; fi
