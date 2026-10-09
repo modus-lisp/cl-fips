@@ -39,6 +39,9 @@ node_yaml() {  # $1 file, $2 tcp port, $3 optional peer port
     echo "  log_level: trace"
     echo "  control:"
     echo "    socket_path: \"$DIR/control.sock\""
+    echo "  native_api:"
+    echo "    enabled: true"
+    echo "    socket_path: \"$DIR/api.sock\""
     echo "tun:"
     echo "  enabled: false"
     echo "dns:"
@@ -55,6 +58,14 @@ node_yaml() {  # $1 file, $2 tcp port, $3 optional peer port
       echo "        addr: \"127.0.0.1:$3\""
     fi
   } > "$1"
+}
+
+check_echo() {  # $1 lisp log
+  [ -x "$ECHO_BIN" ] && [ "${CL_FIPS_ECHO:-on}" != "off" ] || return 0
+  ok=$(grep -c "FSP echo OK" "$1"); bad=$(grep -c "FSP echo MISMATCH" "$1")
+  if [ "$bad" -ge 1 ]; then echo "  FAIL: $bad echo replies did not match what we sent"; fail=1
+  elif [ "$ok" -ge 1 ]; then echo "  echo: the node returned $ok of our probes from port 4600, byte for byte"
+  else echo "  FAIL: no echo reply from the node on port 4600"; fail=1; fi
 }
 
 check_node_log() {  # $1 arm, $2 log
@@ -95,9 +106,15 @@ check_node_log() {  # $1 arm, $2 log
   if [ "${CL_FIPS_FSP:-on}" != "off" ]; then
     if grep -q "Session established (responder, XK)" "$2"; then echo "  node: FSP session established (responder, XK)"
     else echo "  FAIL: node did not establish an FSP session"; fail=1; fi
-    dp=$(grep -c "IPv6 shim decompression failed.*len=15" "$2")
-    if [ "$dp" -ge 1 ]; then echo "  node: decrypted and dispatched $dp DataPackets from Lisp (15-byte probes)"
-    else echo "  FAIL: node decrypted no DataPacket from Lisp"; fail=1; fi
+    if [ -x "$ECHO_BIN" ]; then
+      dp=$(grep -c "Native API flow closed by its client local=4600" "$2")
+      if [ "$dp" -ge 1 ]; then echo "  node: native-echo served $dp DataPackets from Lisp on port 4600"
+      else echo "  FAIL: node served no DataPacket from Lisp on port 4600"; fail=1; fi
+    else
+      dp=$(grep -c "IPv6 shim decompression failed.*len=15" "$2")
+      if [ "$dp" -ge 1 ]; then echo "  node: decrypted and dispatched $dp DataPackets from Lisp (15-byte probes)"
+      else echo "  FAIL: node decrypted no DataPacket from Lisp"; fail=1; fi
+    fi
   fi
   if grep -qE "Removing peer|Peer removed" "$2"; then echo "  FAIL: node removed the peer"; fail=1
   else echo "  node: never removed the peer"; fi
@@ -108,6 +125,18 @@ check_node_log() {  # $1 arm, $2 log
   else echo "  node: no rekey in ${SECS}s (both sides rekey at ~105-135 s; run >= 140 s to check)"; fi
 }
 
+# native-echo (upstream examples/): holds node port 4600 and returns what it gets.
+ECHO_BIN="${ECHO_BIN:-$(dirname "$FIPS_BIN")/examples/native-echo}"
+EP=""
+start_echo() {  # $1 arm; after the node's native API socket exists
+  if [ ! -x "$ECHO_BIN" ]; then echo "  (native-echo not built at $ECHO_BIN: probes go to the IPv6 shim)"; return; fi
+  i=0; until [ -S "$DIR/api.sock" ] || [ $i -ge 50 ]; do sleep 0.2; i=$((i+1)); done
+  "$ECHO_BIN" "$DIR/api.sock" 4600 > "$DIR/echo-$1.log" 2>&1 &
+  EP=$!
+  # the probes must not start before the echo holds port 4600
+  i=0; until grep -q "accepting on port" "$DIR/echo-$1.log" 2>/dev/null || [ $i -ge 50 ]; do sleep 0.2; i=$((i+1)); done
+}
+
 $LISP keygen "$DIR" || { echo "FAIL: keygen"; exit 1; }
 
 # --- dial: Lisp initiator -> node -------------------------------------------------
@@ -116,10 +145,12 @@ node_yaml "$DIR/dial.yaml" "$P"
 "$FIPS_BIN" -c "$DIR/dial.yaml" > "$DIR/node-dial.log" 2>&1 &
 NP=$!
 i=0; until grep -q "TCP accept loop starting" "$DIR/node-dial.log" || [ $i -ge 50 ]; do sleep 0.2; i=$((i+1)); done
+start_echo dial
 echo "== dial (node on 127.0.0.1:$P)"
 timeout $((SECS + 60)) $LISP dial "$DIR" "$P" "$SECS" > "$DIR/lisp-dial.log" 2>&1 || fail=1
-sleep 1; kill $NP 2>/dev/null; wait $NP 2>/dev/null
+sleep 1; kill $NP 2>/dev/null; wait $NP 2>/dev/null; [ -n "$EP" ] && kill $EP 2>/dev/null; EP=""
 grep -E "HANDSHAKE|msg_types|remote static|PASS|FAIL" "$DIR/lisp-dial.log" | sed 's/^/  /'
+check_echo "$DIR/lisp-dial.log"
 check_node_log dial "$DIR/node-dial.log"
 
 # --- accept: node initiator -> Lisp ------------------------------------------------
@@ -131,9 +162,12 @@ i=0; until grep -q LISTENING "$DIR/lisp-accept.log" || [ $i -ge 300 ]; do sleep 
 echo "== accept (Lisp on 127.0.0.1:$LP)"
 "$FIPS_BIN" -c "$DIR/accept.yaml" > "$DIR/node-accept.log" 2>&1 &
 NP=$!
+i=0; until grep -q "TCP accept loop starting" "$DIR/node-accept.log" || [ $i -ge 50 ]; do sleep 0.2; i=$((i+1)); done
+start_echo accept
 wait $AP || fail=1
-kill $NP 2>/dev/null; wait $NP 2>/dev/null
+kill $NP 2>/dev/null; wait $NP 2>/dev/null; [ -n "$EP" ] && kill $EP 2>/dev/null; EP=""
 grep -E "HANDSHAKE|msg_types|remote static|PASS|FAIL" "$DIR/lisp-accept.log" | sed 's/^/  /'
+check_echo "$DIR/lisp-accept.log"
 check_node_log accept "$DIR/node-accept.log"
 
 # --- control: dial again with ReceiverReports OFF -----------------------------------
@@ -148,9 +182,10 @@ node_yaml "$DIR/control.yaml" "$P"
 "$FIPS_BIN" -c "$DIR/control.yaml" > "$DIR/node-control.log" 2>&1 &
 NP=$!
 i=0; until grep -q "TCP accept loop starting" "$DIR/node-control.log" || [ $i -ge 50 ]; do sleep 0.2; i=$((i+1)); done
+start_echo control
 echo "== control: dial with ReceiverReports off (CL_FIPS_REPORTS=no-rr, ${CSECS}s)"
 CL_FIPS_REPORTS=no-rr timeout $((CSECS + 60)) $LISP dial "$DIR" "$P" "$CSECS" > "$DIR/lisp-control.log" 2>&1
-sleep 1; kill $NP 2>/dev/null; wait $NP 2>/dev/null
+sleep 1; kill $NP 2>/dev/null; wait $NP 2>/dev/null; [ -n "$EP" ] && kill $EP 2>/dev/null; EP=""
 grep -E "REPORTS|HANDSHAKE|PASS|FAIL" "$DIR/lisp-control.log" | sed 's/^/  /'
 crr=$(grep -c "Processed ReceiverReport" "$DIR/node-control.log")
 cun=$(grep -c "Resending unconfirmed" "$DIR/node-control.log")

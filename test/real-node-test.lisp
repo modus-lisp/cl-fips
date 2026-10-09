@@ -110,6 +110,11 @@
 (defvar *stats* nil)
 (defun bump (key) (incf (getf *stats* key 0)))
 
+(defun echo-enabled-p ()
+  "CL_FIPS_ECHO: unset or \"on\" = probe the node's native-echo on port 4600
+   (the default); \"off\" = probe the IPv6 shim on port 256."
+  (not (equal (sb-ext:posix-getenv "CL_FIPS_ECHO") "off")))
+
 (defun fsp-enabled-p ()
   "CL_FIPS_FSP: unset or \"on\" = run an end-to-end FSP session through the node
    (the default); \"off\" = none."
@@ -127,7 +132,7 @@
    msg_types seen."
   (let* ((t0 (ms)) (deadline (+ t0 (* 1000 secs))) (next-hb 0) (seen '())
          (last-frame-log 0)
-         (fsp nil) (next-data 0) (data-count 0)
+         (fsp nil) (next-data 0) (data-count 0) (last-probe nil)
          (node-addr (cl-fips:node-addr node-pub))
          (our-addr (cl-fips:node-addr (secp256k1-fast.ecdh:keypair-public-bytes static))))
     (loop while (< (ms) deadline) do
@@ -150,10 +155,16 @@
               (out "~6d FSP SessionSetup sent to the node (XK msg1)" (- (ms) t0))))))
       (when (and fsp (eq (cl-fips:fsp-initiator-phase fsp) :established) (>= (ms) next-data))
         (incf data-count)
-        (let ((d (cl-fips:fsp-data-datagram fsp (natrium:ascii->bytes (format nil "cl-fips probe ~d" data-count))
-                                            :timestamp-ms (ldb (byte 32 0) (- (ms) t0)))))
+        ;; CL_FIPS_ECHO=on (default): the probe goes to port 4600, which the node's
+        ;; native-echo holds, so the node sends the bytes back; otherwise the IPv6
+        ;; shim (256) decrypts and rejects them.
+        (let* ((payload (natrium:ascii->bytes (format nil "cl-fips probe ~d" data-count)))
+               (port (if (echo-enabled-p) 4600 256))
+               (d (cl-fips:fsp-data-datagram fsp payload :dst-port port
+                                                         :timestamp-ms (ldb (byte 32 0) (- (ms) t0)))))
+          (setf last-probe payload)
           (cl-fips:stream-link-send link d)
-          (out "~6d FSP DataPacket ~d sent (dst_port 256)" (- (ms) t0) data-count))
+          (out "~6d FSP DataPacket ~d sent (dst_port ~d)" (- (ms) t0) data-count port))
         (setf next-data (+ (ms) 5000)))
       (multiple-value-bind (actions reports) (cl-fips:stream-link-poll link)
         (dolist (a actions)
@@ -190,9 +201,17 @@
                           (multiple-value-bind (mt sp dp data) (cl-fips:fsp-open-data
                                                                 (cl-fips:fsp-initiator-session fsp)
                                                                 payload)
-                            (declare (ignore sp dp data))
-                            (out "~6d FSP inbound established frame msg_type=0x~2,'0x len=~d"
-                                 (- (ms) t0) mt (length payload))))
+                            (declare (ignore dp))
+                            (cond
+                              ((and (= mt #x10) (= sp 4600))
+                               (if (and last-probe (equalp data last-probe))
+                                   (out "~6d FSP echo OK: the node returned our ~d bytes from port 4600"
+                                        (- (ms) t0) (length data))
+                                   (out "~6d FSP echo MISMATCH from port 4600 (~d bytes)"
+                                        (- (ms) t0) (length data))))
+                              (t
+                               (out "~6d FSP inbound established frame msg_type=0x~2,'0x len=~d"
+                                    (- (ms) t0) mt (length payload))))))
                          (t (out "~6d FSP phase ~d ignored" (- (ms) t0)
                                  (cl-fips:prefix-phase payload)))))
                    (error (e) (out "~6d FSP: ~a" (- (ms) t0) e))))
