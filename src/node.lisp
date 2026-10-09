@@ -17,8 +17,10 @@
 ;;;;   (:link-event EVENT LINK)        a link rekey packet (:rekey-answered ...)
 ;;;;   (:link-action ACTION LINK)      a link rekey action from the tick (:cutover ...)
 ;;;;   (:link-drop REASON LINK)        a non-fatal link error: the frame was dropped
-;;;;   (:link-closed REASON LINK)      a fatal link error, or :dead (silent too long):
-;;;                                   the link is gone
+;;;;   (:link-closed REASON LINK [MSG1])  a fatal link error, :dead (silent too long),
+;;;                                   :disconnect (the peer said it was going),
+;;;                                   or :peer-restart (its peer restarted; MSG1 is
+;;;                                   the new handshake, to accept): the link is gone
 ;;;;   (:forwarded DEST TTL LINK)      a SessionDatagram forwarded out of LINK
 ;;;;   (:dropped REASON DEST)          a transit datagram not forwarded
 ;;;;   (:established PEER)             our session with PEER completed its handshake
@@ -48,8 +50,17 @@
 (in-package #:cl-fips)
 
 (defconstant +node-heartbeat-ms+ 5000)
+(defconstant +disconnect-msg-type+ #x50
+  "proto/link.rs Disconnect: [0x50][reason], reason 0 shutdown, 1 restart, ...
+   (fmp/wire.rs DisconnectReason).  Authenticated like any link frame.")
 (defconstant +fsp-setup-resend-ms+ 4000)
 (defconstant +fsp-setup-max-tries+ 10)
+(defconstant +restart-quiet-ms+ 15000
+  "EPOCH_RESTART_MIN_INTERVAL_SECS: a msg1 under a new epoch from a peer we hold a
+   link with replaces that link only once the link has been quiet this long.  The
+   msg1 is authentic but may be a replay; a peer that is really alive keeps the
+   link busy, so a replay cannot tear down a working peering.  A peer that really
+   restarted stops talking, and its msg1 resends (1, 3, 7, 15 s) land past this.")
 (defconstant +link-dead-ms+ 30000
   "link_dead_timeout_secs: a link we have heard nothing authentic on for this long
    is removed.  On TCP the peer's close usually comes first; on UDP this is the only
@@ -79,7 +90,8 @@
   (lookup-forwarded-at (make-hash-table :test 'equalp)); target -> ms of the last forward
   (lookup-signed (make-hash-table :test 'eq))          ; link -> (window-start . count)
   (setups-admitted (make-hash-table :test 'eq))        ; link -> (window-start . count)
-  (coord-cache (make-hash-table :test 'equalp)))       ; target -> (coords path-mtu ms)
+  (coord-cache (make-hash-table :test 'equalp))        ; target -> (coords path-mtu ms)
+  (peer-epochs (make-hash-table :test 'equalp)))       ; peer -> the epoch its link last came up with
 
 (defun make-fips-node (static)
   "A node for the key pair STATIC.  Links join it with NODE-ADD-LINK, and must be
@@ -108,6 +120,14 @@
         (lambda (l) (route-filter-for (fips-node-own node) (node-filters node) l)))
   (setf (fips-node-links node) (append (fips-node-links node) (list link)))
   (%node-mark-tree-dirty node)
+  ;; a peer that comes back under a new epoch restarted: whatever end-to-end session
+  ;; we held with it, it no longer does
+  (let* ((peer (node-link-peer link))
+         (epoch (stream-link-remote-epoch link))
+         (known (gethash peer (fips-node-peer-epochs node))))
+    (when (and known epoch (not (equalp known epoch)))
+      (remhash peer (fips-node-sessions node)))
+    (when epoch (setf (gethash peer (fips-node-peer-epochs node)) epoch)))
   link)
 
 (defun node-remove-link (node link)
@@ -127,6 +147,13 @@
       (progn (node-remove-link node link)
              (list :link-closed (link-error-reason e) link))
       (list :link-drop (link-error-reason e) link)))
+
+(defun node-disconnect-all (node &key (reason 0))
+  "Tell every peer we are going (Disconnect, REASON 0 = shutdown, 1 = restart) and
+   drop the links.  Best effort: a peer that misses it finds out by silence."
+  (dolist (l (copy-list (fips-node-links node)))
+    (ignore-errors (stream-link-send l (bytes-of +disconnect-msg-type+ reason)))
+    (node-remove-link node l)))
 
 (defun node-route (node dest &optional from-link)
   "The link toward DEST: the link whose peer is DEST, else the first other link
@@ -298,6 +325,15 @@
           ((null m) (list (list :link-event ev link)))
           ((zerop (length m)) nil)
           (t
+           ;; the peer says it is going: the link and our sessions with it go now, as
+           ;; upstream's remove_active_peer does, so a restart re-peers at once
+           (when (= (aref m 0) +disconnect-msg-type+)
+             (let ((peer (node-link-peer link)))
+               (node-remove-link node link)
+               (remhash peer (fips-node-sessions node))
+               (return-from node-receive
+                 (list (list :link-closed :disconnect link nil
+                             (if (> (length m) 1) (aref m 1) #xff))))))
            (when (member (aref m 0) (list +tree-announce-msg-type+ +filter-announce-msg-type+))
              ;; the tree and the filters are the node's: every link re-announces
              (%node-mark-tree-dirty node))
@@ -307,10 +343,18 @@
                    (#.+lookup-request-msg-type+ (node-lookup-request node link (subseq m 1) now))
                    (#.+lookup-response-msg-type+ (node-lookup-response node link (subseq m 1) now)))))))
     (link-error (e)
-      (if (link-error-fatal-p e)
-          (progn (node-remove-link node link)
-                 (list (list :link-closed (link-error-reason e) link)))
-          (list (list :link-drop (link-error-reason e) link))))))
+      (cond
+        ((link-error-fatal-p e)
+         (node-remove-link node link)
+         (list (list :link-closed (link-error-reason e) link)))
+        ;; a msg1 under a new epoch from this link's peer: it restarted.  Once the link
+        ;; has been quiet long enough, it goes, and the msg1 is handed back so the
+        ;; caller can accept it as the new link.
+        ((and (eq (link-error-reason e) :peer-restart)
+              (>= (- now (gethash link (fips-node-last-heard node) now)) +restart-quiet-ms+))
+         (node-remove-link node link)
+         (list (list :link-closed :peer-restart link (link-error-packet e))))
+        (t (list (list :link-drop (link-error-reason e) link)))))))
 
 (defun node-datagram (node link body now)
   "A SessionDatagram BODY (msg_type stripped) that arrived on LINK."

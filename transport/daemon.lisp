@@ -177,8 +177,8 @@
 (defun daemon-stop (d)
   "Close every link, dial and listener."
   (setf (daemon-stopping d) t)
-  (dolist (l (copy-list (cl-fips:fips-node-links (daemon-node d))))
-    (cl-fips:node-remove-link (daemon-node d) l))
+  ;; peers hear we are going (Disconnect), so a restart re-peers at once
+  (cl-fips:node-disconnect-all (daemon-node d))
   (dolist (p (daemon-peers d))
     (when (peer-dial p) (ignore-errors (cl-fips:byte-port-close (cl-fips:link-dial-port (peer-dial p)))))
     (setf (peer-dial p) nil (peer-state p) :idle))
@@ -222,7 +222,7 @@
           (peer-backoff p) (min +backoff-max-ms+ (* 2 b)))
     (when reason (%emit d (list :peer-down (or (peer-alias p) (peer-npub p)) reason)))))
 
-(defun %add-link (d link transport socket)
+(defun %add-link (d link transport socket &key host port)
   (let* ((node (daemon-node d))
          (addr (cl-fips:node-link-peer link))
          (peer (%peer-for-addr d addr))
@@ -247,7 +247,8 @@
         (setf (peer-dial peer) nil))
       (setf (peer-state peer) :up (peer-link peer) link (peer-backoff peer) +backoff-min-ms+))
     (cl-fips:node-add-link node link)
-    (setf (gethash link (daemon-links d)) (list :transport transport :socket socket :peer peer))
+    (setf (gethash link (daemon-links d)) (list :transport transport :socket socket :peer peer
+                                                :host host :port port))
     (%emit d (list :peer-up (if peer (or (peer-alias peer) (peer-npub peer)) (cl-fips:node-link-peer link))
                    transport))))
 
@@ -293,7 +294,7 @@
         (cond
           (link
            (setf (peer-dial p) nil)
-           (%add-link d link (peer-transport p) (peer-dial-socket p)))
+           (%add-link d link (peer-transport p) (peer-dial-socket p) :host (peer-host p) :port (peer-port p)))
           ((and (eq what :peer-msg1)
                 (not (cl-fips:node-addr< (cl-fips:fips-node-own (daemon-node d)) (peer-addr p))))
            ;; both of us dialled: the smaller node_addr stays initiator, so we yield,
@@ -313,7 +314,13 @@
   (dolist (ev events)
     (%emit d ev)
     (case (first ev)
-      (:link-closed (%forget-link d (third ev)))
+      (:link-closed
+       ;; a restarted peer's msg1 arrived on the old link: offer it to the accept
+       ;; path, so the new link comes up this step
+       (let ((info (gethash (third ev) (daemon-links d))))
+         (when (and (fourth ev) (eq (getf info :transport) :udp) (daemon-udp d) (getf info :host))
+           (cl-fips.transport:udp-offer (daemon-udp d) (getf info :host) (getf info :port) (fourth ev))))
+       (%forget-link d (third ev)))
       ((:established :accepted) (%flush-pending d (second ev)))
       ((:lookup-ok :lookup-failed)
        ;; open the session the lookup was for; a failed lookup still tries, with
@@ -399,12 +406,12 @@
                                (cl-fips.transport:udp-port-ready-p udp (cl-fips:link-dial-port (peer-dial p))))
                     do (%dial-input d p))))
           (loop repeat +udp-accepts-per-step+
-                for (port host) = (multiple-value-list (cl-fips.transport:udp-accept udp))
+                for (port host uport) = (multiple-value-list (cl-fips.transport:udp-accept udp))
                 while port
                 do (handler-case
                        (%add-link d (apply #'cl-fips:stream-link-accept port (daemon-static d) (daemon-epoch d)
                                            :timeout-ms 0 (%link-opts d :udp))
-                                  :udp nil)
+                                  :udp nil :host host :port uport)
                      (cl-fips:link-error (e)
                        ;; closing the port forgets the address, so it may dial again
                        (cl-fips:byte-port-close port)

@@ -3,6 +3,9 @@
 #
 #   FIPS_BIN=/path/to/fips MODUS_BIN=/path/to/modus [TRANSPORT=udp|tcp] \
 #     scripts/run-modus-node.sh [SECS] [dial|accept]
+# ROUNDS=N (accept arm): the upstream node is started, killed and started again N
+# times against the one modus node, with the same identity, and each round reports
+# how long the node took to promote us and whether a session and echoes came back.
 #
 # dial    the modus node's config names the upstream node; it dials it over UDP.
 # accept  the upstream node's config names the modus node; it dials modus.
@@ -45,13 +48,47 @@ else
 fi
 echo "(:identity (:key-file \"$DIR/modus.key\") :$T (:bind \"127.0.0.1:$MPORT\") :peers $PEERS)" > "$DIR/modus.conf"
 
-"$FIPS_BIN" -c "$DIR/node.yaml" > "$DIR/node.log" 2>&1 & NP=$!
-i=0; until [ -S "$DIR/api.sock" ] || [ $i -ge 50 ]; do sleep 0.2; i=$((i+1)); done
-"$ECHO_BIN" "$DIR/api.sock" 4600 > "$DIR/echo.log" 2>&1 & EP=$!
+start_node() {
+  "$FIPS_BIN" -c "$DIR/node.yaml" > "$DIR/node${1:-}.log" 2>&1 & NP=$!
+  i=0; until [ -S "$DIR/api.sock" ] || [ $i -ge 50 ]; do sleep 0.2; i=$((i+1)); done
+  "$ECHO_BIN" "$DIR/api.sock" 4600 > "$DIR/echo.log" 2>&1 & EP=$!
+}
 echo "== a cl-fips node on modus ($ARM, $T), ${SECS}s"
+# The node dials the moment it starts, so in the accept arm it starts only once the
+# modus node is LISTENING: loading the libraries from source takes modus ~15 s, and
+# a node that dials into nothing backs off (UDP: resends at 1/3/8/17 s, then a 30 s
+# handshake timeout and a 10 s wait; TCP: refused, then retries 10 s and 20 s apart).
+[ "$ARM" = dial ] && start_node
 MODUS_FIPS_CONFIG="$DIR/modus.conf" MODUS_FIPS_TARGET="$(cat "$DIR/node.pub")" MODUS_FIPS_SECS="$SECS" \
-  timeout $((SECS + 900)) "$MODUS_BIN" --script "$HERE/test/modus-node.lisp" > "$DIR/modus.log" 2>&1
+  timeout $((SECS + 900)) "$MODUS_BIN" --script "$HERE/test/modus-node.lisp" > "$DIR/modus.log" 2>&1 &
+MP=$!
+if [ "$ARM" = accept ]; then
+  i=0; until grep -aq LISTENING "$DIR/modus.log" 2>/dev/null || [ $i -ge 600 ]; do sleep 0.2; i=$((i+1)); done
+  R=${ROUNDS:-1}
+  if [ "$R" -gt 1 ]; then
+    for r in $(seq 1 $R); do
+      t0=$(date +%s.%N)
+      start_node "-$r"
+      i=0; until grep -aq "Connection promoted to active peer" "$DIR/node-$r.log" || [ $i -ge 600 ]; do sleep 0.1; i=$((i+1)); done
+      t1=$(date +%s.%N)
+      i=0; until grep -aq "Session established" "$DIR/node-$r.log" || [ $i -ge 300 ]; do sleep 0.1; i=$((i+1)); done
+      t2=$(date +%s.%N)
+      sleep ${HOLD:-10}
+      echoes=$(grep -ac "Native API flow closed by its client local=4600" "$DIR/node-$r.log")
+      printf '  round %d: promoted %.1f s after start, session %.1f s, %d echoes served\n' \
+        $r $(echo "$t1 - $t0" | bc) $(echo "$t2 - $t0" | bc) "$echoes"
+      kill $EP $NP 2>/dev/null; wait $EP $NP 2>/dev/null
+      sleep 1
+    done
+    cp "$DIR/node-$R.log" "$DIR/node.log"
+    kill $MP 2>/dev/null
+  else
+    start_node
+  fi
+fi
+wait $MP
 rc=$?
+[ "${ROUNDS:-1}" -gt 1 ] && rc=0
 kill $EP $NP 2>/dev/null; wait $EP $NP 2>/dev/null
 grep -aE "LOADED|LOAD FAILED|LISTENING|peer-up|established|probes sent|PASS|FAIL" "$DIR/modus.log" | grep -v "^ *[0-9.]* frame" | head -12 | sed 's/^/  /'
 fail=$rc

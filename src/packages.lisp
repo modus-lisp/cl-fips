@@ -51,7 +51,7 @@
            #:node-add-link #:node-remove-link #:node-link-peer #:node-route #:node-session
            #:node-our-coords #:node-peer-coords
            #:node-open-session #:node-send-data #:node-start-rekey
-           #:node-tick #:node-receive
+           #:node-tick #:node-receive #:node-disconnect-all
            #:node-lookup #:node-cached-coords #:node-tree-peer-p
            #:make-lookup-request #:make-lookup-response #:encode-lookup-request #:decode-lookup-request
            #:encode-lookup-response #:decode-lookup-response #:sign-lookup-proof #:verify-lookup-response
@@ -82,7 +82,7 @@
            #:link-our-addr #:link-peer-addr #:link-drain-started #:link-config
            ;; FMP over a byte stream (link.lisp)
            #:+default-stream-mtu+ #:link-error #:link-error-reason #:link-error-detail
-           #:link-error-fatal-p #:make-byte-port #:byte-port-close #:byte-port-closed
+           #:link-error-fatal-p #:link-error-packet #:make-byte-port #:byte-port-close #:byte-port-closed
            #:make-datagram-port #:datagram-port-p
            #:stream-link-dial #:link-dial #:link-dial-p #:link-dial-port #:link-dial-receive
            #:link-dial-tick #:link-dial-next-due-ms #:+fsp-data-overhead+ #:+handshake-timeout-ms+

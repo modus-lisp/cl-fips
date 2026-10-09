@@ -38,7 +38,10 @@
 (define-condition link-error (error)
   ((reason :initarg :reason :reader link-error-reason)
    (detail :initarg :detail :initform nil :reader link-error-detail)
-   (fatal :initarg :fatal :initform t :reader link-error-fatal-p))
+   (fatal :initarg :fatal :initform t :reader link-error-fatal-p)
+   ;; the packet that was dropped, for a caller that may act on it (a msg1 from a
+   ;; restarted peer: the node may accept it as a new link)
+   (packet :initarg :packet :initform nil :reader link-error-packet))
   (:report (lambda (c s)
              (format s "FMP link error ~s~@[: ~a~]~:[ (frame dropped, link kept)~;~]"
                      (link-error-reason c) (link-error-detail c) (link-error-fatal-p c)))))
@@ -435,9 +438,9 @@
            (values msg ts flags counter slot)))
         (:msg2 (write-fmp-packet port a) (values nil :rekey-answered))
         (:rekey-complete (values nil :rekey-complete))
-        (:drop (link-fail port (%drop-reason a)
-                          (format nil "phase 0x~x packet dropped: ~(~a~)" (prefix-phase wire) a)
-                          nil))))))
+        (:drop (error 'link-error :reason (%drop-reason a) :fatal nil :packet wire
+                                  :detail (format nil "phase 0x~x packet dropped: ~(~a~)"
+                                                  (prefix-phase wire) a)))))))
 
 (defconstant +routing-interval-ms+ 10000)
 

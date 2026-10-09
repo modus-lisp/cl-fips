@@ -159,7 +159,41 @@
              (and (null (fips-node-links a)) (has-event events :link-closed :dead)))
       (check "N8: the dead peer left A's tree" (null (node-peer-coords a (fips-node-own b)))))))
 
+(defun test-node-disconnect ()
+  "N9: a peer's Disconnect closes the link at once and drops our session with it."
+  (let* ((a (new-test-node)) (b (new-test-node)) (eps (connect-nodes a b)))
+    (settle (list a b) eps 0)
+    (node-open-session a (node-pub b) :now 1000)
+    (pump eps 1000)
+    (check "N9: B holds a session with A" (node-session b (fips-node-own a)))
+    (node-disconnect-all a)
+    (let ((ev (pump eps 1100)))
+      (check "N9: B closes the link on A's Disconnect" (has-event ev :link-closed :disconnect))
+      (check "N9: ... has no link left" (null (fips-node-links b)))
+      (check "N9: ... and no session with A" (null (node-session b (fips-node-own a)))))))
+
+(defun test-node-epoch-reset ()
+  "N10: a peer that links again under a new epoch has restarted: our old session
+   with it is dropped, and a new one opens."
+  (let* ((a (new-test-node)) (b (new-test-node)) (eps (connect-nodes a b)))
+    (settle (list a b) eps 0)
+    (node-open-session b (node-pub a) :now 1000)
+    (pump eps 1000)
+    (check "N10: B's session with A is up"
+           (eq (cl-fips::fsp-initiator-phase (node-session b (fips-node-own a))) :established))
+    ;; A restarts: the same key, a new epoch, a new link (the old one is gone)
+    (node-remove-link b (second (second eps)))
+    (let* ((a2 (make-fips-node (cl-fips::fips-node-static a)))
+           (eps2 (connect-nodes a2 b)))
+      (check "N10: B dropped the stale session" (null (node-session b (fips-node-own a))))
+      (settle (list a2 b) eps2 2000)
+      (node-open-session b (node-pub a2) :now 3000)
+      (check "N10: ... and a new one comes up"
+             (has-event (pump eps2 3000) :established (fips-node-own a2))))))
+
 (defun test-node ()
+  (test-node-disconnect)
+  (test-node-epoch-reset)
   (test-node-dead-link)
   (test-node-two)
   (test-node-transit)
