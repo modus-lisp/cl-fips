@@ -31,6 +31,11 @@
 ;;;;   (:rekey-ack PEER)               PEER answered our rekey; our msg3 is sent
 ;;;;   (:cutover PEER WHO)             a rekeyed session became current (:theirs / :ours)
 ;;;;   (:setup-resent PEER)            an unanswered SessionSetup was sent again
+;;;   (:rekey-started PEER)           the schedule started a rekey of our session with PEER
+;;;   (:msg3-resent PEER)             our msg3, not yet confirmed by a frame, sent again
+;;;   (:session-failed PEER)          our SessionSetup went unanswered; the session is gone
+;;;   (:session-crossed PEER :kept-ours)  PEER opened to us while we opened to it; we
+;;;                                   keep initiating (we have the smaller address)
 ;;;;   (:unsolicited SRC PHASE)        a datagram for us from a node we hold no session
 ;;;;                                   with (for example, an upstream error signal)
 ;;;;   (:session-error PEER MESSAGE)   a session message refused (forged, wrong key ...)
@@ -43,6 +48,8 @@
 (in-package #:cl-fips)
 
 (defconstant +node-heartbeat-ms+ 5000)
+(defconstant +fsp-setup-resend-ms+ 4000)
+(defconstant +fsp-setup-max-tries+ 10)
 (defconstant +link-dead-ms+ 30000
   "link_dead_timeout_secs: a link we have heard nothing authentic on for this long
    is removed.  On TCP the peer's close usually comes first; on UDP this is the only
@@ -64,12 +71,14 @@
   (heartbeat-due (make-hash-table :test 'eq))   ; link -> ms
   (last-heard (make-hash-table :test 'eq))      ; link -> ms of its last authentic packet
   (dead-ms +link-dead-ms+)                      ; NIL: never reap a silent link
+  (auto-rekey t)                                ; NIL: rekey sessions only when asked
   (forwarded 0) (no-route 0) (ttl-expired 0) (too-big 0) (malformed 0)
   ;; coordinate discovery (lookup.lisp)
   (lookup-recent (make-hash-table))                    ; request_id -> (link ms forwarded)
   (lookup-pending (make-hash-table :test 'equalp))     ; target -> LOOKUP-PENDING
   (lookup-forwarded-at (make-hash-table :test 'equalp)); target -> ms of the last forward
   (lookup-signed (make-hash-table :test 'eq))          ; link -> (window-start . count)
+  (setups-admitted (make-hash-table :test 'eq))        ; link -> (window-start . count)
   (coord-cache (make-hash-table :test 'equalp)))       ; target -> (coords path-mtu ms)
 
 (defun make-fips-node (static)
@@ -107,6 +116,8 @@
   (setf (fips-node-links node) (remove link (fips-node-links node)))
   (remhash link (fips-node-heartbeat-due node))
   (remhash link (fips-node-last-heard node))
+  (remhash link (fips-node-lookup-signed node))
+  (remhash link (fips-node-setups-admitted node))
   (%node-mark-tree-dirty node))
 
 (defun %link-failed (node link e)
@@ -153,7 +164,8 @@
       (when (link-error-fatal-p e)
         (node-remove-link node link)
         (error 'node-error :reason :link-failed :detail (link-error-reason e)))
-      (error e))))
+      ;; a non-fatal one (a datagram over the link MTU) is the node's error too
+      (error 'node-error :reason (link-error-reason e) :detail (link-error-detail e)))))
 
 ;;; --- sessions we open -----------------------------------------------------------
 
@@ -228,14 +240,44 @@
     ;; a session a peer opened but never completed is dropped after the handshake timeout
     (let ((stale '()))
       (maphash (lambda (peer fi)
-                 (when (and (member (fsp-initiator-phase fi) '(:ack-sent :refused))
-                            (> (- now (fsp-initiator-setup-sent-at fi)) +fsp-handshake-timeout-ms+))
+                 (when (or (and (member (fsp-initiator-phase fi) '(:ack-sent :refused))
+                                (> (- now (fsp-initiator-setup-sent-at fi)) +fsp-handshake-timeout-ms+))
+                           ;; ours, every resend spent and the last one unanswered
+                           (and (eq (fsp-initiator-phase fi) :setup-sent)
+                                (>= (fsp-initiator-setup-tries fi) +fsp-setup-max-tries+)
+                                (> (- now (fsp-initiator-setup-sent-at fi)) +fsp-setup-resend-ms+)))
                    (push peer stale)))
                (fips-node-sessions node))
-      (dolist (peer stale) (remhash peer (fips-node-sessions node))))
+      (dolist (peer stale)
+        (when (eq (fsp-initiator-phase (node-session node peer)) :setup-sent)
+          (push (list :session-failed peer) events))
+        (remhash peer (fips-node-sessions node))))
     (setf events (append (reverse (node-lookup-tick node now)) events))
+    ;; the session rekey schedule (rekey.rs check_session_rekey)
+    (let ((due '()))
+      (maphash (lambda (peer fi)
+                 (when (fsp-cutover-due-p fi now)
+                   (fsp-cut-over-if-ours fi now)
+                   ;; with no data going out, the peer would never see the new
+                   ;; epoch: send a frame under it (upstream's session reports do)
+                   (handler-case (%node-send node (fsp-warmup-datagram fi now))
+                     (node-error () nil))
+                   (push (list :cutover peer :ours) events))
+                 (when (and (fips-node-auto-rekey node) (fsp-rekey-due-p fi now)) (push peer due)))
+               (fips-node-sessions node))
+      (dolist (peer due)
+        (handler-case (progn (node-start-rekey node peer :now now)
+                             (push (list :rekey-started peer) events))
+          (error () nil))))
     (maphash (lambda (peer fi)
-               (let ((again (fsp-resend-setup fi now)))
+               (let ((again (fsp-resend-msg3 fi now)))
+                 (when again
+                   (handler-case (progn (%node-send node again) (push (list :msg3-resent peer) events))
+                     (node-error () nil)))))
+             (fips-node-sessions node))
+    (maphash (lambda (peer fi)
+               (let ((again (fsp-resend-setup fi now :interval-ms +fsp-setup-resend-ms+
+                                                     :max-tries +fsp-setup-max-tries+)))
                  (when again
                    (handler-case (progn (%node-send node again) (push (list :setup-resent peer) events))
                      (node-error () nil)))))
@@ -308,15 +350,36 @@
                     (progn (incf (fips-node-too-big node))
                            (list (list :dropped (link-error-reason e) dest)))))))))))))
 
+(defconstant +setups-per-second+ 20
+  "New sessions a link's peer may ask us to answer each second: each costs a
+   handshake's work and a table entry before its source is authenticated.")
+
 (defun node-local (node link body now)
   "A datagram for us: hand it to the session with its source."
-  (declare (ignore link))
   (let* ((src (sd-src body))
          (fi (node-session node src))
          (payload (bytes-slice body 35))
          (phase (and (>= (length payload) 4) (prefix-phase payload))))
-    (if (and (eql phase 1) (or (null fi) (member (fsp-initiator-phase fi) '(:ack-sent :refused))))
-        ;; a session the peer opens (or a resend of its setup): we answer as responder
+    (when (and (eql phase 1) fi (eq (fsp-initiator-phase fi) :ack-sent))
+      ;; a resend of the setup we answered gets the same ack; any other setup under
+      ;; this source waits until that handshake ends (the source is not yet
+      ;; authenticated, so it must not displace it)
+      (return-from node-local
+        (if (equalp (fsp-setup-digest body) (fsp-initiator-setup-digest fi))
+            (handler-case (progn (%node-send node (fsp-initiator-ack-datagram fi))
+                                 (list (list :accept-answered src)))
+              (node-error (e) (list (list :session-error src (princ-to-string e)))))
+            (list (list :session-error src "a handshake with this source is in progress")))))
+    (when (and (eql phase 1) fi (eq (fsp-initiator-phase fi) :setup-sent))
+      ;; both sides opened at once: the smaller node_addr stays initiator, the other
+      ;; answers (session.rs initiation_winner)
+      (if (bytes< (fips-node-own node) src)
+          (return-from node-local (list (list :session-crossed src :kept-ours)))
+          (setf fi nil)))
+    (if (and (eql phase 1) (or (null fi) (eq (fsp-initiator-phase fi) :refused)))
+        ;; a session the peer opens: we answer as responder
+        (if (not (%rate-ok-p (fips-node-setups-admitted node) link now +setups-per-second+))
+            (list (list :session-error src "setup rate limit for this link"))
         (handler-case
             (multiple-value-bind (new ack)
                 (fsp-accept-setup (fips-node-static node) (natrium:random-bytes 8) (fips-node-own node)
@@ -324,21 +387,21 @@
               (setf (gethash src (fips-node-sessions node)) new)
               (%node-send node ack)
               (list (list :accept-answered src)))
-          (error (e) (list (list :session-error src (princ-to-string e)))))
+          (error (e) (list (list :session-error src (princ-to-string e))))))
     (if (null fi)
         (list (list :unsolicited src phase))
         (handler-case
             (cond
               ((and (eql phase 3) (eq (fsp-initiator-phase fi) :ack-sent))
-               (fsp-complete-accept fi body)
+               (fsp-complete-accept fi body :now now)
                (list (list :accepted src)))
               ((not (member (fsp-initiator-phase fi) '(:setup-sent :established)))
                (list (list :unsolicited src phase)))
               ((and (eql phase 2) (eq (fsp-initiator-phase fi) :setup-sent))
-               (%node-send node (fsp-handle-ack fi body))
+               (%node-send node (fsp-handle-ack fi body :now now))
                (list (list :established src)))
               ((and (eql phase 2) (fsp-initiator-rekey-hs fi))
-               (%node-send node (fsp-handle-rekey-ack fi body))
+               (%node-send node (fsp-handle-rekey-ack fi body :now now))
                (list (list :rekey-ack src)))
               ((eql phase 1)
                (%node-send node (fsp-handle-rekey-setup fi body :now now))
@@ -428,19 +491,48 @@
     (nreverse events)))
 
 (defun %lookup-purge (node now)
-  (let ((old '()))
+  (let ((old '()) (quiet '()))
     (maphash (lambda (id rec) (when (> (- now (second rec)) +lookup-recent-expiry-ms+) (push id old)))
              (fips-node-lookup-recent node))
-    (dolist (id old) (remhash id (fips-node-lookup-recent node)))))
+    (dolist (id old) (remhash id (fips-node-lookup-recent node)))
+    ;; the per-target forward limiter only needs entries inside its interval
+    (maphash (lambda (target at) (when (>= (- now at) +lookup-forward-interval-ms+) (push target quiet)))
+             (fips-node-lookup-forwarded-at node))
+    (dolist (target quiet) (remhash target (fips-node-lookup-forwarded-at node)))))
+
+(defconstant +lookup-recent-max+ 4096)
+
+(defun %lookup-make-room (node link)
+  "The request table is full: evict one entry, charged to whoever filled it (core.rs
+   make_room).  The arriving link's oldest entry goes if that link holds at least
+   its share; otherwise the oldest entry of the link holding the most."
+  (let ((counts (make-hash-table :test 'eq)) (oldest (make-hash-table :test 'eq)))
+    (maphash (lambda (id rec)
+               (let ((l (first rec)))
+                 (incf (gethash l counts 0))
+                 (let ((o (gethash l oldest)))
+                   (when (or (null o) (< (second rec) (second (gethash o (fips-node-lookup-recent node)))))
+                     (setf (gethash l oldest) id)))))
+             (fips-node-lookup-recent node))
+    (let* ((share (max 1 (floor +lookup-recent-max+ (max 1 (length (fips-node-links node))))))
+           (victim (if (>= (gethash link counts 0) share)
+                       link
+                       (let ((best nil) (n -1))
+                         (maphash (lambda (l c) (when (> c n) (setf best l n c))) counts)
+                         best))))
+      (when victim (remhash (gethash victim oldest) (fips-node-lookup-recent node))))))
+
+(defun %rate-ok-p (table key now limit)
+  "At most LIMIT events a second for KEY, counted in TABLE."
+  (let ((w (gethash key table)))
+    (when (or (null w) (>= (- now (car w)) 1000))
+      (setf w (cons now 0) (gethash key table) w))
+    (when (< (cdr w) limit) (incf (cdr w)) t)))
 
 (defun %may-sign-p (node link now)
   "At most 10 lookup proofs a second for each link (the discovery signing budget)."
-  (let ((w (gethash link (fips-node-lookup-signed node))))
-    (when (or (null w) (>= (- now (car w)) 1000))
-      (setf w (cons now 0) (gethash link (fips-node-lookup-signed node)) w))
-    (when (< (cdr w) 10) (incf (cdr w)) t)))
+  (%rate-ok-p (fips-node-lookup-signed node) link now 10))
 
-(defconstant +lookup-recent-max+ 4096)
 
 (defun node-lookup-request (node link body now)
   "A LookupRequest from LINK's peer: answer it if it names us, else pass it on."
@@ -456,9 +548,9 @@
            ((let ((p (gethash target (fips-node-lookup-pending node))))
               (and p (member id (lookup-pending-ids p))))
             (list (list :lookup-dropped :own-request)))
-           ((>= (hash-table-count (fips-node-lookup-recent node)) +lookup-recent-max+)
-            (list (list :lookup-dropped :busy)))
            (t
+            (when (>= (hash-table-count (fips-node-lookup-recent node)) +lookup-recent-max+)
+              (%lookup-make-room node link))
             (setf (gethash id (fips-node-lookup-recent node)) (list link now nil))
             (cond
               ((equalp target (fips-node-own node))

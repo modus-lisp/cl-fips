@@ -71,7 +71,9 @@
           (cond
             (peer (%enqueue peer packet))
             ;; a stranger: keep it only if it opens a handshake
-            ((and (>= size 4) (= (ldb (byte 4 0) (aref packet 0)) cl-fips:+phase-msg1+)
+            ;; exactly a msg1: version 0, phase 1, the msg1 size -- anything else
+            ;; would register an address for a handshake that cannot happen
+            ((and (= size 114) (= (aref packet 0) cl-fips:+phase-msg1+)
                   (not (assoc key (udp-endpoint-fresh ep) :test #'equal)))
              (push (cons key packet) (udp-endpoint-fresh ep))
              (when (> (length (udp-endpoint-fresh ep)) +udp-max-fresh+)
@@ -149,3 +151,11 @@
         thereis (and (eq (upeer-port-object peer) port) (upeer-queue peer) t)))
 
 (defun udp-accept-pending-p (ep) (and (udp-endpoint-fresh ep) t))
+
+(defun udp-offer (ep host port packet)
+  "Put PACKET (a msg1 from HOST:PORT) where UDP-ACCEPT will find it, as if it had
+   just arrived from a stranger.  For a dial that yields to the peer's own dial."
+  (let ((key (list (%host-octets host) port)))
+    (unless (or (gethash key (udp-endpoint-peers ep))
+                (assoc key (udp-endpoint-fresh ep) :test #'equal))
+      (push (cons key packet) (udp-endpoint-fresh ep)))))

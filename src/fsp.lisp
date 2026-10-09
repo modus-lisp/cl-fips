@@ -131,6 +131,18 @@
                         (bytes-of))))
     (bytes-cat header cleartext ct)))
 
+(defconstant +fsp-coords-warmup-msg-type+ #x14)
+
+(defun fsp-seal-warmup (session timestamp-ms our-coords peer-coords &key k)
+  "A CoordsWarmup frame (wire.rs 0x14): an inner header and nothing else, CP set
+   with both coordinates.  Upstream logs it and drops it; it is what tells the peer
+   a rekeyed session is now in use when we have no data to send."
+  (let* ((inner (bytes-cat (encode-u32le timestamp-ms) (bytes-of +fsp-coords-warmup-msg-type+ 0)))
+         (counter (natrium.noise:session-current-send-counter session))
+         (header (encode-fsp-header (logior +fsp-flag-cp+ (if k +fsp-flag-k+ 0)) (length inner) counter))
+         (ct (natrium.noise:session-encrypt-with-aad session inner header)))
+    (bytes-cat header (encode-coords our-coords) (encode-coords peer-coords) ct)))
+
 (defun fsp-skip-coords (wire offset)
   "The offset just past two cleartext coordinates starting at OFFSET.  A zero
    count is an absent coordinate, as upstream's decode_optional_coords reads it."
@@ -174,6 +186,9 @@
 
 ;;; --- The initiator's side of the session ------------------------------------
 
+(defconstant +fsp-msg3-first-resend-ms+ 1000)
+(defconstant +fsp-msg3-max-tries+ 6)
+
 (defstruct (fsp-initiator (:constructor %make-fsp-initiator))
   hs              ; natrium.noise XK handshake state (our initial handshake)
   session         ; the established NOISE-SESSION, or NIL until msg3 is sent
@@ -191,7 +206,79 @@
   (setup-sent-at 0) (setup-tries 0)  ; when it was last sent, and how often
   (pending-hs-at 0) (rekey-hs-at 0)  ; when each rekey handshake began (ms)
   (previous-started-ms 0)   ; when the drain began: the cutover (ms)
-  (previous-last-used-ms 0)) ; the last frame that opened under the previous session
+  (previous-last-used-ms 0)  ; the last frame that opened under the previous session
+  ;; our msg3 (initial or rekey), resent until a frame from the peer opens under the
+  ;; session it established -- a lost msg3 otherwise leaves the peer without it
+  msg3-datagram msg3-for (msg3-sent-at 0) (msg3-tries 0)
+  ;; as responder: the setup we answered and our answer, so a resend of the same
+  ;; setup gets the same ack (session.rs) instead of a new handshake
+  setup-digest ack-datagram
+  ;; the rekey schedule: when the current session began, and this session's jitter
+  (established-ms 0) (rekey-jitter-ms 0))
+
+(defconstant +fsp-rekey-after-ms+ 120000 "node.rekey.after_secs.")
+(defconstant +fsp-rekey-after-messages+ 65536 "node.rekey.after_messages.")
+(defconstant +fsp-rekey-jitter-ms+ 15000)
+(defconstant +fsp-rekey-dampening-ms+ 30000 "REKEY_DAMPENING_SECS.")
+(defconstant +fsp-cutover-delay-ms+ 2000 "FSP_CUTOVER_DELAY_MS.")
+
+(defun %fsp-established (fi now)
+  (setf (fsp-initiator-established-ms fi) now
+        (fsp-initiator-rekey-jitter-ms fi)
+        (- (mod (decode-u32le (natrium:random-bytes 4) 0) (1+ (* 2 +fsp-rekey-jitter-ms+)))
+           +fsp-rekey-jitter-ms+)))
+
+(defun fsp-rekey-due-p (fi now)
+  "upstream poll_rekey's InitiateRekey: an established session with no rekey under
+   way, not just rekeyed by the peer, that is old enough (120 s, jittered) or has
+   sent enough (65536 frames)."
+  (and (eq (fsp-initiator-phase fi) :established)
+       (not (or (fsp-initiator-rekey-hs fi) (fsp-initiator-pending-hs fi)
+                (fsp-initiator-pending-session fi)
+                ;; our msg3 still unconfirmed (and still being resent)
+                (and (fsp-initiator-msg3-datagram fi)
+                     (< (fsp-initiator-msg3-tries fi) +fsp-msg3-max-tries+))))
+       (not (and (plusp (fsp-initiator-pending-hs-at fi))
+                 (< (- now (fsp-initiator-pending-hs-at fi)) +fsp-rekey-dampening-ms+)))
+       (or (>= (- now (fsp-initiator-established-ms fi))
+               (+ +fsp-rekey-after-ms+ (fsp-initiator-rekey-jitter-ms fi)))
+           (>= (natrium.noise:session-current-send-counter (fsp-initiator-session fi))
+               +fsp-rekey-after-messages+))))
+
+(defun fsp-warmup-datagram (fi now)
+  "A CoordsWarmup on the current session, as a SessionDatagram link message."
+  (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi)
+                           (fsp-seal-warmup (fsp-initiator-session fi) (ldb (byte 32 0) now)
+                                            (fsp-initiator-our-coords fi) (fsp-initiator-peer-coords fi)
+                                            :k (fsp-initiator-k fi))))
+
+(defun fsp-cutover-due-p (fi now)
+  "Our rekey is complete and the peer has had msg3 for the cutover delay: cut over
+   even if we have no data to send (upstream's liveness cutover timer)."
+  (and (fsp-initiator-rekey-initiator-p fi) (fsp-initiator-pending-session fi)
+       (>= (- now (fsp-initiator-msg3-sent-at fi)) +fsp-cutover-delay-ms+)))
+
+
+(defun %fsp-msg3-sent (fi datagram session now)
+  (setf (fsp-initiator-msg3-datagram fi) datagram (fsp-initiator-msg3-for fi) session
+        (fsp-initiator-msg3-sent-at fi) now (fsp-initiator-msg3-tries fi) 1)
+  datagram)
+
+(defun fsp-resend-msg3 (fi now)
+  "Our msg3 again, if no frame from the peer has confirmed it yet and the resend is
+   due (1 s, doubling, six sends in all).  Returns the link message, or NIL."
+  (when (and (fsp-initiator-msg3-datagram fi)
+             (< (fsp-initiator-msg3-tries fi) +fsp-msg3-max-tries+)
+             (>= (- now (fsp-initiator-msg3-sent-at fi))
+                 (* +fsp-msg3-first-resend-ms+ (ash 1 (1- (fsp-initiator-msg3-tries fi))))))
+    (setf (fsp-initiator-msg3-sent-at fi) now)
+    (incf (fsp-initiator-msg3-tries fi))
+    (fsp-initiator-msg3-datagram fi)))
+
+(defun %fsp-confirmed (fi session)
+  "A frame from the peer opened under SESSION: if our msg3 made it, it arrived."
+  (when (and session (eq session (fsp-initiator-msg3-for fi)))
+    (setf (fsp-initiator-msg3-datagram fi) nil (fsp-initiator-msg3-for fi) nil)))
 
 (defun make-fsp-initiator (static peer-static-bytes local-epoch our-addr peer-addr
                            our-coords peer-coords)
@@ -227,7 +314,7 @@
     (incf (fsp-initiator-setup-tries fi))
     (fsp-initiator-setup-datagram fi)))
 
-(defun fsp-handle-ack (fi datagram-body)
+(defun fsp-handle-ack (fi datagram-body &key (now 0))
   "Consume the SessionAck (XK msg2) carried in a SessionDatagram body.  Returns the
    SessionDatagram body that carries SessionMsg3 (XK msg3); the session is
    established from that point."
@@ -248,7 +335,10 @@
         (setf (fsp-initiator-session fi)
               (natrium.noise:handshake-into-session (fsp-initiator-hs fi))
               (fsp-initiator-phase fi) :established)
-        (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi) ok)))))
+        (%fsp-established fi now)
+        (%fsp-msg3-sent fi (encode-session-datagram (fsp-initiator-our-addr fi)
+                                                    (fsp-initiator-peer-addr fi) ok)
+                        (fsp-initiator-session fi) now)))))
 
 (defun fsp-data-datagram (fi data &key (src-port 0) (dst-port +fsp-port-ipv6-shim+)
                                     (timestamp-ms 0) (now 0))
@@ -366,7 +456,7 @@
           (fsp-initiator-rekey-hs-at fi) now)
     (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi) setup)))
 
-(defun fsp-handle-rekey-ack (fi datagram-body)
+(defun fsp-handle-rekey-ack (fi datagram-body &key (now 0))
   "Consume the peer's SessionAck (XK msg2) for a rekey we started.  Returns the
    SessionDatagram link message that carries SessionMsg3 (XK msg3)."
   (unless (fsp-initiator-rekey-hs fi) (error "no rekey is outstanding"))
@@ -385,11 +475,15 @@
           (setf (fsp-initiator-pending-session fi) (natrium.noise:handshake-into-session hs)
                 (fsp-initiator-rekey-hs fi) nil
                 (fsp-initiator-rekey-initiator-p fi) t)
-          (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi)
-                                   (encode-fsp-msg3 msg3)))))))
+          (%fsp-msg3-sent fi (encode-session-datagram (fsp-initiator-our-addr fi)
+                                                      (fsp-initiator-peer-addr fi)
+                                                      (encode-fsp-msg3 msg3))
+                          (fsp-initiator-pending-session fi) now))))))
 
 (defun fsp-begin-drain (fi now)
-  "The session this replaces is kept for late frames, from NOW."
+  "The session this replaces is kept for late frames, from NOW, and the new one's
+   age is counted from NOW."
+  (%fsp-established fi now)
   (setf (fsp-initiator-previous-started-ms fi) now
         (fsp-initiator-previous-last-used-ms fi) 0))
 
@@ -440,9 +534,12 @@
                   (handler-case (multiple-value-list (fsp-open-data session wire))
                     (natrium.noise:noise-error () nil)))))
       (let ((opened (try cur)))
-        (when opened (return-from fsp-open-any (values-list opened))))
+        (when opened
+          (%fsp-confirmed fi cur)
+          (return-from fsp-open-any (values-list opened))))
       (let ((opened (try pend)))
         (when opened
+          (%fsp-confirmed fi pend)
           (setf (fsp-initiator-previous-session fi) cur
                 (fsp-initiator-session fi) pend
                 (fsp-initiator-pending-session fi) nil
@@ -474,14 +571,22 @@
       (let ((hs (fips-make-xk-responder static local-epoch)))
         (natrium.noise:xk-read-message-1 hs msg1)
         (let ((msg2 (natrium.noise:xk-write-message-2 hs)))
-          (values (%make-fsp-initiator :hs hs :our-addr our-addr :peer-addr src
-                                       :our-coords our-coords :peer-coords src-coords
-                                       :phase :ack-sent :static static :local-epoch local-epoch
-                                       :setup-sent-at now)
-                  (encode-session-datagram our-addr src
-                                           (encode-fsp-setup-or-ack 2 0 our-coords src-coords msg2))))))))
+          (let ((ack (encode-session-datagram our-addr src
+                                              (encode-fsp-setup-or-ack 2 0 our-coords src-coords msg2))))
+            (values (%make-fsp-initiator :hs hs :our-addr our-addr :peer-addr src
+                                         :our-coords our-coords :peer-coords src-coords
+                                         :phase :ack-sent :static static :local-epoch local-epoch
+                                         :setup-sent-at now
+                                         :setup-digest (fsp-setup-digest datagram-body)
+                                         :ack-datagram ack)
+                    ack)))))))
 
-(defun fsp-complete-accept (fi datagram-body)
+(defun fsp-setup-digest (datagram-body)
+  "What identifies a SessionSetup across resends: its payload (TTL and path_mtu are
+   rewritten on the way, so they are left out)."
+  (natrium:sha256 (coerce (subseq datagram-body 35) '(simple-array (unsigned-byte 8) (*)))))
+
+(defun fsp-complete-accept (fi datagram-body &key (now 0))
   "Consume the msg3 of a session the peer opened.  The source address it claimed
    must be the node_addr of the key msg3 authenticates (upstream
    handle_session_msg3, AddrMismatch); otherwise a node could open a session under
@@ -499,5 +604,8 @@
           (error "SessionMsg3 source address does not match the authenticated key"))
         (setf (fsp-initiator-peer-static fi) key
               (fsp-initiator-session fi) (natrium.noise:handshake-into-session hs)
-              (fsp-initiator-phase fi) :established)
+              (fsp-initiator-phase fi) :established
+              ;; the initiator resends msg3 until our first frame reaches it
+              (fsp-initiator-last-msg3 fi) (decode-fsp-msg3 payload))
+        (%fsp-established fi now)
         t))))

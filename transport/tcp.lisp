@@ -15,10 +15,10 @@
 (defpackage #:cl-fips.transport
   (:use #:common-lisp)
   (:export #:tcp-connect #:tcp-listen #:tcp-listener-port #:tcp-accept #:tcp-listener-close
-           #:socket-byte-port #:tcp-socket-buffered-p #:udp-endpoint-socket
+           #:socket-byte-port #:tcp-socket-buffered-p #:tcp-read-available #:prefixed-byte-port #:udp-endpoint-socket
            #:+udp-mtu+ #:udp-open #:udp-close #:udp-endpoint-local-port #:udp-pump
            #:udp-peer-port #:udp-accept #:udp-port-ready-p #:udp-accept-pending-p
-           #:udp-endpoint-received #:udp-endpoint-dropped))
+           #:udp-endpoint-received #:udp-endpoint-dropped #:udp-offer))
 
 (in-package #:cl-fips.transport)
 
@@ -59,6 +59,38 @@
                                                   :timeout timeout-secs :nodelay t)))
     (values (socket-byte-port socket) socket)))
 
+(defun tcp-read-available (socket)
+  "Whatever bytes SOCKET has now, without waiting.  Returns (values octets eof-p);
+   call it only after WAIT-FOR-INPUT said SOCKET is readable, so that no bytes and
+   no LISTEN means the peer closed."
+  (let ((stream (usocket:socket-stream socket)) (out '()))
+    (handler-case
+        (progn
+          (loop while (listen stream) do (push (read-byte stream) out))
+          (if out
+              (values (coerce (nreverse out) '(vector (unsigned-byte 8))) nil)
+              (let ((b (read-byte stream nil nil)))
+                (if b
+                    (values (coerce (list b) '(vector (unsigned-byte 8))) nil)
+                    (values (make-array 0 :element-type '(unsigned-byte 8)) t)))))
+      (error () (values (coerce (nreverse out) '(vector (unsigned-byte 8))) t)))))
+
+(defun prefixed-byte-port (prefix port)
+  "PORT, with the octets PREFIX (already read off it) served first."
+  (let ((pos 0))
+    (cl-fips:make-byte-port
+     (lambda (n deadline)
+       (let* ((take (min n (- (length prefix) pos)))
+              (head (subseq prefix pos (+ pos take))))
+         (incf pos take)
+         (if (= take n)
+             (values head :ok)
+             (multiple-value-bind (rest status)
+                 (funcall (cl-fips::byte-port-read-exactly port) (- n take) deadline)
+               (values (concatenate '(vector (unsigned-byte 8)) head rest) status)))))
+     (cl-fips::byte-port-write-all port)
+     (lambda () (cl-fips:byte-port-close port)))))
+
 (defun tcp-socket-buffered-p (socket)
   "True if bytes are already inside SOCKET's Lisp stream.  WAIT-FOR-INPUT watches the
    descriptor, so it cannot see these: an event loop must drain them first."
@@ -75,7 +107,9 @@
    second value is the socket."
   (when (usocket:wait-for-input (list listener) :timeout (and timeout-ms (/ timeout-ms 1000d0))
                                          :ready-only t)
-    (let ((socket (usocket:socket-accept listener :element-type '(unsigned-byte 8))))
-      (values (socket-byte-port socket) socket))))
+    (let ((socket (handler-case (usocket:socket-accept listener :element-type '(unsigned-byte 8))
+                    ;; out of descriptors, or the connection went away first
+                    (error () nil))))
+      (when socket (values (socket-byte-port socket) socket)))))
 
 (defun tcp-listener-close (listener) (ignore-errors (usocket:socket-close listener)))

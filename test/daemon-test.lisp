@@ -141,6 +141,102 @@
           (cl-fips.daemon:daemon-stop a)
           (cl-fips.daemon:daemon-stop b))))))
 
+(defun test-daemon-udp-junk ()
+  "Review 2: junk from an address must not register it."
+  (let* ((d (cl-fips.daemon:daemon-start
+             (cl-fips.daemon:make-daemon (list :udp (list :bind "127.0.0.1:0")) :log nil)))
+         (ep (cl-fips.daemon::daemon-udp d))
+         (port (cl-fips.daemon:daemon-udp-port d)))
+    (unwind-protect
+         (progn
+           (raw-udp-send port (octets 1 0 0 0))
+           (raw-udp-send port (cl-fips::build-msg1 7 (filler 106 1)))   ; the right size, not a handshake
+           (loop repeat 20 do (cl-fips.daemon:daemon-step d :max-wait-ms 20))
+           (check "D6 a short datagram that looks like a msg1 registers nothing, nor does a forged msg1"
+                  (and (zerop (hash-table-count (cl-fips.transport::udp-endpoint-peers ep)))
+                       (null (cl-fips.transport::udp-endpoint-fresh ep)))))
+      (cl-fips.daemon:daemon-stop d))))
+
+(defun test-daemon-replay ()
+  "Review 1: a second, authentic dial from a peer whose link is alive is refused."
+  (let* ((ka (generate-keypair)) (kb (generate-keypair))
+         (b (cl-fips.daemon:daemon-start
+             (cl-fips.daemon:make-daemon (list :udp (list :bind "127.0.0.1:0")) :keypair kb :log nil)))
+         (bport (cl-fips.daemon:daemon-udp-port b))
+         (a (cl-fips.daemon:daemon-start
+             (cl-fips.daemon:make-daemon
+              (list :udp (list :bind "127.0.0.1:0")
+                    :peers (list (list :npub (npub-encode (keypair-public-bytes kb)) :transport :udp
+                                       :addr (format nil "127.0.0.1:~d" bport))))
+              :keypair ka :log nil)))
+         (refused nil))
+    (setf (cl-fips.daemon::daemon-on-event b)
+          (lambda (d e) (declare (ignore d)) (when (eq (first e) :link-refused) (setf refused t))))
+    (unwind-protect
+         (progn
+           (step-until (list a b) (lambda () (= 1 (length (fips-node-links (cl-fips.daemon:daemon-node b))))))
+           (let ((live (first (fips-node-links (cl-fips.daemon:daemon-node b)))))
+             ;; the same key dials again from a new address (an attacker replaying, or a
+             ;; second process with A's key): authentic, but A's link is alive
+             (let* ((ep (cl-fips.transport:udp-open))
+                    (port (cl-fips.transport:udp-peer-port ep "127.0.0.1" bport)))
+               (unwind-protect
+                    (progn
+                      (cl-fips:stream-link-dial port ka (keypair-public-bytes kb) (random-epoch)
+                                                :mtu cl-fips.transport:+udp-mtu+ :now-ms 0)
+                      (step-until (list a b) (lambda () refused) :timeout-ms 3000))
+                 (cl-fips.transport:udp-close ep)))
+             (check "D7 B refuses a new link while A's is alive" refused)
+             (check "D7 ... and keeps A's link"
+                    (equal (fips-node-links (cl-fips.daemon:daemon-node b)) (list live)))))
+      (cl-fips.daemon:daemon-stop a) (cl-fips.daemon:daemon-stop b))))
+
+(defun test-daemon-slow-tcp ()
+  "Review 7: a TCP connection that never sends its msg1 does not stall the loop."
+  (let* ((d (cl-fips.daemon:daemon-start
+             (cl-fips.daemon:make-daemon (list :tcp (list :bind "127.0.0.1:0")) :log nil)))
+         (socks (loop repeat 5 collect (usocket:socket-connect "127.0.0.1" (cl-fips.daemon:daemon-tcp-port d)
+                                                               :element-type '(unsigned-byte 8)))))
+    (unwind-protect
+         (progn
+           (dolist (s socks) (write-byte 1 (usocket:socket-stream s)) (finish-output (usocket:socket-stream s)))
+           (let ((t0 (now-ms)))
+             (loop repeat 20 do (cl-fips.daemon:daemon-step d :max-wait-ms 10))
+             (check (format nil "D8 five stalled connections do not stall the loop (~d ms for 20 steps)"
+                            (- (now-ms) t0))
+                    (< (- (now-ms) t0) 2000)))
+           (check "D8 they are held, waiting" (= 5 (length (cl-fips.daemon::daemon-accepting d)))))
+      (dolist (s socks) (ignore-errors (usocket:socket-close s)))
+      (cl-fips.daemon:daemon-stop d))))
+
+(defun test-daemon-crossing ()
+  "Review 10: two daemons that each list the other come up together."
+  (let* ((ka (generate-keypair)) (kb (generate-keypair))
+         (ea (cl-fips.transport:udp-open)) (pa (cl-fips.transport:udp-endpoint-local-port ea))
+         (eb (cl-fips.transport:udp-open)) (pb (cl-fips.transport:udp-endpoint-local-port eb)))
+    (cl-fips.transport:udp-close ea) (cl-fips.transport:udp-close eb)
+    (let* ((a (cl-fips.daemon:daemon-start
+               (cl-fips.daemon:make-daemon
+                (list :udp (list :bind (format nil "127.0.0.1:~d" pa))
+                      :peers (list (list :npub (npub-encode (keypair-public-bytes kb)) :transport :udp
+                                         :addr (format nil "127.0.0.1:~d" pb))))
+                :keypair ka :log nil)))
+           (b (cl-fips.daemon:daemon-start
+               (cl-fips.daemon:make-daemon
+                (list :udp (list :bind (format nil "127.0.0.1:~d" pb))
+                      :peers (list (list :npub (npub-encode (keypair-public-bytes ka)) :transport :udp
+                                         :addr (format nil "127.0.0.1:~d" pa))))
+                :keypair kb :log nil)))
+           (t0 (now-ms)))
+      (unwind-protect
+           (check (format nil "D9 two daemons dialling each other link within 5 s (~d ms)" (- (now-ms) t0))
+                  (and (step-until (list a b)
+                                   (lambda () (and (= 1 (length (fips-node-links (cl-fips.daemon:daemon-node a))))
+                                                   (= 1 (length (fips-node-links (cl-fips.daemon:daemon-node b))))))
+                                   :timeout-ms 5000)
+                       (progn (setf t0 (- (now-ms) (- (now-ms) t0))) t)))
+        (cl-fips.daemon:daemon-stop a) (cl-fips.daemon:daemon-stop b)))))
+
 (defun test-daemon ()
   (flet ((arm (name fn)
            (handler-case (funcall fn)
@@ -150,7 +246,11 @@
     (arm "D2" #'test-daemon-config)
     (arm "D3" (lambda () (daemon-echo-arm :udp "D3 (UDP)")))
     (arm "D4" (lambda () (daemon-echo-arm :tcp "D4 (TCP)")))
-    (arm "D5" #'test-daemon-restart)))
+    (arm "D5" #'test-daemon-restart)
+    (arm "D6" #'test-daemon-udp-junk)
+    (arm "D7" #'test-daemon-replay)
+    (arm "D8" #'test-daemon-slow-tcp)
+    (arm "D9" #'test-daemon-crossing)))
 
 (let ((prev *tcp-suite*))
   (setf *tcp-suite* (lambda () (funcall prev) (test-daemon))))

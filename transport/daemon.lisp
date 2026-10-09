@@ -39,6 +39,13 @@
   "How long an accepted TCP connection may take to deliver its whole msg1 once it
    has become readable.")
 (defconstant +max-pending-sends+ 64 "DataPackets queued per peer while its session opens.")
+(defconstant +replace-quiet-ms+ 15000
+  "EPOCH_RESTART_MIN_INTERVAL_SECS: a new link from a peer replaces the one we hold
+   only if that one has been silent this long.  A msg1 is authentic but replayable,
+   so a replay must not be able to tear down a peering that is alive.")
+(defconstant +accepting-max+ 32 "TCP connections waiting to send their msg1.")
+(defconstant +accepting-ms+ 10000 "How long one of them may take.")
+(defconstant +udp-accepts-per-step+ 8 "Inbound UDP handshakes taken in one step.")
 
 (defun clock-ms () (floor (* 1000 (get-internal-real-time)) internal-time-units-per-second))
 
@@ -77,6 +84,10 @@
 (defun load-or-create-identity (path)
   "The key pair in PATH (an nsec or 64 hex digits on its first line), or a new one
    written there.  Returns (values keypair created-p)."
+  (when (and (probe-file path)
+             (logtest #o077 (sb-posix:stat-mode (sb-posix:stat (namestring path)))))
+    (warn "~a is readable by others (mode ~o); it holds the node's secret key"
+          path (logand #o777 (sb-posix:stat-mode (sb-posix:stat (namestring path))))))
   (if (probe-file path)
       (let ((line (string-trim '(#\Space #\Tab #\Return #\Newline)
                                (with-open-file (in path) (or (read-line in nil) "")))))
@@ -105,7 +116,7 @@
   config node static epoch
   udp tcp-listener
   (links (make-hash-table :test 'eq))   ; link -> plist (:transport :socket :peer)
-  (accepting '())                       ; ((socket . port) ...) TCP, msg1 not yet read
+  (accepting '())                       ; ((socket port started bytes) ...) TCP, msg1 not yet in
   (peers '())
   (pending (make-hash-table :test 'equalp)) ; node_addr -> list of (data src dst)
   (awaiting (make-hash-table :test 'equalp)) ; node_addr -> key, a lookup before an open
@@ -169,7 +180,7 @@
   (dolist (p (daemon-peers d))
     (when (peer-dial p) (ignore-errors (cl-fips:byte-port-close (cl-fips:link-dial-port (peer-dial p)))))
     (setf (peer-dial p) nil (peer-state p) :idle))
-  (dolist (a (daemon-accepting d)) (ignore-errors (cl-fips:byte-port-close (cdr a))))
+  (dolist (a (daemon-accepting d)) (ignore-errors (cl-fips:byte-port-close (second a))))
   (setf (daemon-accepting d) nil)
   (when (daemon-udp d) (cl-fips.transport:udp-close (daemon-udp d)))
   (when (daemon-tcp-listener d) (cl-fips.transport:tcp-listener-close (daemon-tcp-listener d)))
@@ -209,11 +220,24 @@
 
 (defun %add-link (d link transport socket)
   (let* ((node (daemon-node d))
-         (peer (%peer-for-addr d (cl-fips:node-link-peer link))))
-    ;; a peer that dials us again (it restarted) replaces the link we held
+         (addr (cl-fips:node-link-peer link))
+         (peer (%peer-for-addr d addr))
+         (old (find addr (cl-fips:fips-node-links node) :key #'cl-fips:node-link-peer :test #'equalp)))
+    ;; a peer that dials us again (it restarted) replaces the link we held -- but only
+    ;; once that link has gone quiet: a replayed msg1 authenticates too
+    (when old
+      (let ((heard (gethash old (cl-fips::fips-node-last-heard node))))
+        (if (and heard (< (- (daemon-now d) heard) +replace-quiet-ms+))
+            (progn
+              ;; close the newcomer's port only: STREAM-LINK-CLOSE would also take
+              ;; the live peer out of the shared tree
+              (cl-fips:byte-port-close (cl-fips:stream-link-port link))
+              (%emit d (list :link-refused addr :live-link))
+              (when peer
+                (setf (peer-link peer) (or (peer-link peer) old) (peer-state peer) :up))
+              (return-from %add-link nil))
+            (%drop-link d old))))
     (when peer
-      (when (and (peer-link peer) (member (peer-link peer) (cl-fips:fips-node-links node)))
-        (%drop-link d (peer-link peer)))
       (when (peer-dial peer)
         (ignore-errors (cl-fips:byte-port-close (cl-fips:link-dial-port (peer-dial peer))))
         (setf (peer-dial peer) nil))
@@ -260,11 +284,20 @@
 (defun %dial-input (d p)
   "Input for P's dial: one packet."
   (handler-case
-      (let ((link (cl-fips:link-dial-receive (peer-dial p)
-                                             :timeout-ms (%transport-wait (peer-transport p)))))
-        (when link
-          (setf (peer-dial p) nil)
-          (%add-link d link (peer-transport p) (peer-dial-socket p))))
+      (multiple-value-bind (link what packet)
+          (cl-fips:link-dial-receive (peer-dial p) :timeout-ms (%transport-wait (peer-transport p)))
+        (cond
+          (link
+           (setf (peer-dial p) nil)
+           (%add-link d link (peer-transport p) (peer-dial-socket p)))
+          ((and (eq what :peer-msg1)
+                (not (cl-fips:node-addr< (cl-fips:fips-node-own (daemon-node d)) (peer-addr p))))
+           ;; both of us dialled: the smaller node_addr stays initiator, so we yield,
+           ;; drop our dial and answer theirs
+           (cl-fips:byte-port-close (cl-fips:link-dial-port (peer-dial p)))
+           (setf (peer-dial p) nil (peer-state p) :idle
+                 (peer-next-attempt p) (+ (daemon-now d) +backoff-max-ms+))
+           (cl-fips.transport:udp-offer (daemon-udp d) (peer-host p) (peer-port p) packet))))
     (cl-fips:link-error (e)
       (when (cl-fips:link-error-fatal-p e)
         (%emit d (list :dial-failed (or (peer-alias p) (peer-npub p)) (cl-fips:link-error-reason e)))
@@ -285,7 +318,12 @@
          (when key
            (remhash (second ev) (daemon-awaiting d))
            (unless (cl-fips:node-session (daemon-node d) (second ev))
-             (cl-fips:node-open-session (daemon-node d) key :now (daemon-now d))))))
+             (handler-case (cl-fips:node-open-session (daemon-node d) key :now (daemon-now d))
+               (error (e) (%emit d (list :send-failed (second ev) (princ-to-string e)))))))))
+      (:session-failed
+       (when (gethash (second ev) (daemon-pending d))
+         (remhash (second ev) (daemon-pending d))
+         (%emit d (list :send-failed (second ev) "no answer to our SessionSetup"))))
       (:data
        (destructuring-bind (peer sp dp data ts) (rest ev)
          (declare (ignore ts))
@@ -318,7 +356,7 @@
              (daemon-links d))
     (dolist (p (daemon-peers d))
       (when (and (peer-dial p) (eq (peer-transport p) :tcp)) (push (peer-dial-socket p) s)))
-    (dolist (a (daemon-accepting d)) (push (car a) s))
+    (dolist (a (daemon-accepting d)) (push (first a) s))
     s))
 
 (defun %buffered-anywhere-p (d)
@@ -355,13 +393,16 @@
               (loop while (and (peer-dial p)
                                (cl-fips.transport:udp-port-ready-p udp (cl-fips:link-dial-port (peer-dial p))))
                     do (%dial-input d p))))
-          (loop for (port host) = (multiple-value-list (cl-fips.transport:udp-accept udp))
+          (loop repeat +udp-accepts-per-step+
+                for (port host) = (multiple-value-list (cl-fips.transport:udp-accept udp))
                 while port
                 do (handler-case
                        (%add-link d (apply #'cl-fips:stream-link-accept port (daemon-static d) (daemon-epoch d)
                                            :timeout-ms 0 (%link-opts d :udp))
                                   :udp nil)
                      (cl-fips:link-error (e)
+                       ;; closing the port forgets the address, so it may dial again
+                       (cl-fips:byte-port-close port)
                        (%emit d (list :accept-failed host (cl-fips:link-error-reason e))))))
           (loop for l in (copy-list (cl-fips:fips-node-links (daemon-node d)))
                 when (eq (getf (gethash l (daemon-links d)) :transport) :udp)
@@ -372,15 +413,35 @@
       (let ((listener (daemon-tcp-listener d)))
         (when (and listener (member listener ready))
           (multiple-value-bind (port socket) (cl-fips.transport:tcp-accept listener :timeout-ms 0)
-            (when port (push (cons socket port) (daemon-accepting d))))))
+            (when port
+              (if (>= (length (daemon-accepting d)) +accepting-max+)
+                  (cl-fips:byte-port-close port)
+                  (push (list socket port (daemon-now d) (make-array 0 :element-type '(unsigned-byte 8)))
+                        (daemon-accepting d)))))))
+      ;; a connection's msg1 is collected as it arrives, never waited for: the loop
+      ;; must not stall on a peer that sends it slowly, or not at all
       (dolist (a (copy-list (daemon-accepting d)))
-        (when (%tcp-ready (car a) ready)
-          (setf (daemon-accepting d) (remove a (daemon-accepting d)))
-          (handler-case
-              (%add-link d (apply #'cl-fips:stream-link-accept (cdr a) (daemon-static d) (daemon-epoch d)
-                                  :timeout-ms +accept-timeout-ms+ (%link-opts d :tcp))
-                         :tcp (car a))
-            (cl-fips:link-error (e) (%emit d (list :accept-failed :tcp (cl-fips:link-error-reason e)))))))
+        (destructuring-bind (socket port started bytes) a
+          (flet ((done () (setf (daemon-accepting d) (remove a (daemon-accepting d)))))
+            (cond
+              ((> (- (daemon-now d) started) +accepting-ms+)
+               (done) (cl-fips:byte-port-close port))
+              ((%tcp-ready socket ready)
+               (multiple-value-bind (more eof) (cl-fips.transport:tcp-read-available socket)
+                 (let ((all (concatenate '(vector (unsigned-byte 8)) bytes more)))
+                   (setf (fourth a) all)
+                   (cond
+                     ((>= (length all) 114)
+                      (done)
+                      (handler-case
+                          (%add-link d (apply #'cl-fips:stream-link-accept
+                                              (cl-fips.transport:prefixed-byte-port all port)
+                                              (daemon-static d) (daemon-epoch d)
+                                              :timeout-ms +accept-timeout-ms+ (%link-opts d :tcp))
+                                     :tcp socket)
+                        (cl-fips:link-error (e)
+                          (%emit d (list :accept-failed :tcp (cl-fips:link-error-reason e))))))
+                     (eof (done) (cl-fips:byte-port-close port))))))))))
       (dolist (p (daemon-peers d))
         (when (and (peer-dial p) (eq (peer-transport p) :tcp) (%tcp-ready (peer-dial-socket p) ready))
           (%dial-input d p)))
@@ -411,7 +472,11 @@
 (defun daemon-run (d &key until (max-wait-ms 200))
   "Step until DAEMON-STOPPING is set, or UNTIL (a function of no arguments) is true."
   (loop until (or (daemon-stopping d) (and until (funcall until)))
-        do (daemon-step d :max-wait-ms max-wait-ms))
+        do (handler-case (daemon-step d :max-wait-ms max-wait-ms)
+             ;; one bad packet or a bug in one path must not take the node down
+             (error (e)
+               (%emit d (list :internal-error (princ-to-string e)))
+               (sleep 0.01))))
   d)
 
 ;;; --- sending ---------------------------------------------------------------------
@@ -486,6 +551,9 @@
              (write-identity (second args) kp)
              (format t "~a~%" (cl-fips:npub-encode (secp256k1-fast.ecdh:keypair-public-bytes kp))))))
       ((and (= (length args) 2) (string= (first args) "npub"))
+       (unless (probe-file (second args))
+         (format *error-output* "~a: no such key file~%" (second args))
+         (sb-ext:exit :code 1))
        (let ((kp (load-or-create-identity (second args))))
          (format t "~a~%" (cl-fips:npub-encode (secp256k1-fast.ecdh:keypair-public-bytes kp)))))
       ((and (= (length args) 2) (string= (first args) "run"))

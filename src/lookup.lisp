@@ -53,9 +53,11 @@
 (defun decode-lookup-request (body)
   "BODY is the message after msg_type.  Signals an error for a malformed one."
   (when (< (length body) 45) (error "LookupRequest body is ~d bytes" (length body)))
-  (make-lookup-request (decode-u64le body 0) (bytes-slice body 8 24) (bytes-slice body 24 40)
-                       (decode-coords body 43)
-                       :ttl (aref body 40) :min-mtu (decode-u16le body 41)))
+  (multiple-value-bind (coords next) (decode-coords body 43)
+    (unless (= next (length body))
+      (error "LookupRequest has ~d bytes after its coordinates" (- (length body) next)))
+    (make-lookup-request (decode-u64le body 0) (bytes-slice body 8 24) (bytes-slice body 24 40)
+                         coords :ttl (aref body 40) :min-mtu (decode-u16le body 41))))
 
 (defun lookup-proof-bytes (request-id target coords)
   (bytes-cat (encode-u64le request-id) target (encode-coords coords)))

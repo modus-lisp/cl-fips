@@ -280,17 +280,22 @@
   "Read one packet for DIAL.  Returns the established STREAM-LINK when it is the msg2
    that answers our msg1, else NIL.  On a stream port the packet must be that msg2:
    anything else is a fatal LINK-ERROR, as before.  On a datagram port anything else
-   is dropped (a non-fatal LINK-ERROR for a malformed datagram, NIL otherwise)."
+   is dropped (a non-fatal LINK-ERROR for a malformed datagram, NIL otherwise),
+   except a msg1: the peer is dialling us at the same time, and that returns
+   (values NIL :PEER-MSG1 packet) so the caller can resolve the crossing."
   (let* ((port (link-dial-port dial))
          (mtu (link-dial-mtu dial))
          (hs (link-dial-hs dial))
          (our-index (link-dial-our-index dial)))
     (if (datagram-port-p port)
         (let ((packet (read-fmp-packet port :mtu mtu :timeout-ms timeout-ms)))
-          (multiple-value-bind (their-index receiver-index noise-msg2) (parse-msg2 packet)
-            (when (and their-index (= receiver-index our-index)
-                       (ignore-errors (natrium.noise:ik-try-read-message-2 hs noise-msg2) t))
-              (%dial-finish dial their-index))))
+          (if (= (prefix-phase packet) +phase-msg1+)
+              ;; the peer is dialling us too: the caller decides who yields
+              (values nil :peer-msg1 packet)
+              (multiple-value-bind (their-index receiver-index noise-msg2) (parse-msg2 packet)
+                (when (and their-index (= receiver-index our-index)
+                           (ignore-errors (natrium.noise:ik-try-read-message-2 hs noise-msg2) t))
+                  (%dial-finish dial their-index)))))
         (let ((packet (%handshake-packet port +phase-msg2+ mtu timeout-ms)))
           (multiple-value-bind (their-index receiver-index noise-msg2) (parse-msg2 packet)
             (unless their-index (link-fail port :handshake-failed "malformed msg2"))

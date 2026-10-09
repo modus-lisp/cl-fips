@@ -46,6 +46,7 @@
                              (:file "transit-test")
                              (:file "node-test")
                              (:file "lookup-test")
+                             (:file "review-test")
                              (:file "link-test"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-fips.test '#:run-all)))
 

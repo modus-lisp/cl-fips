@@ -94,6 +94,7 @@
   (test-transit)                        ; transit-test.lisp
   (test-node)                           ; node-test.lisp
   (test-lookup)                         ; lookup-test.lisp
+  (test-review)                         ; review-test.lisp
   (test-link-local)                     ; link-test.lisp
   (if *tcp-suite*
       (funcall *tcp-suite*)             ; tcp-test.lisp
