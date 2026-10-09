@@ -361,6 +361,81 @@
            (handler-case (progn (fsp-open-any fi (fsp-seal-data rs-old 0 3 (ascii-octets "cap") 99) :now 121000) nil)
              (natrium.noise:noise-error () t)))))
 
+(defun fsp-attacker-rekey (fi attacker-key victim-pub spoofed-src a)
+  "An attacker with ATTACKER-KEY runs a rekey against FI, spoofing SPOOFED-SRC.
+   Returns the msg3 link message the attacker would send (the SessionAck is
+   answered by FI on the way)."
+  (let* ((nh (fips-make-xk-initiator attacker-key victim-pub (octets 7 7 7 7 7 7 7 7)))
+         (m1 (natrium.noise:xk-write-message-1 nh))
+         (setup (encode-session-datagram spoofed-src a (encode-fsp-setup-or-ack 1 0 (list spoofed-src) (list a) m1)))
+         (ack (fsp-handle-rekey-setup fi (subseq setup 1))))
+    (natrium.noise:xk-read-message-2 nh (nth-value 4 (decode-fsp-setup-or-ack (fsp-rekey-ack-payload ack))))
+    (encode-session-datagram spoofed-src a (encode-fsp-msg3 (natrium.noise:xk-write-message-3 nh)))))
+
+(defun test-fsp-adversarial ()
+  "The checks upstream makes against a peer that is not the peer: the rekey key,
+   rollback on forged handshake messages, the handshake timeout, and the K bit."
+  ;; S1: a rekey completed under any key but the peer's is refused
+  (multiple-value-bind (fi ka kb a b rs-old) (fsp-keyed-session)
+    (declare (ignore kb))
+    (let* ((before (fsp-initiator-session fi))
+           (msg3 (fsp-attacker-rekey fi (generate-keypair) (keypair-public-bytes ka) b a)))
+      (check "S1: a rekey under a stranger's key is refused"
+             (handler-case (progn (fsp-handle-rekey-msg3 fi (subseq msg3 1)) nil)
+               (error () t)))
+      (check "S1: the refused rekey leaves no session waiting to take over"
+             (null (fsp-initiator-pending-session fi)))
+      (check "S1: the established session is still the current one"
+             (and (eq (fsp-initiator-session fi) before)
+                  (equalp (nth-value 3 (fsp-open-any fi (fsp-seal-data rs-old 0 3 (ascii-octets "ok") 1)))
+                          (ascii-octets "ok"))))))
+  ;; S2: a forged msg3 does not spend the handshake the genuine msg3 needs
+  (multiple-value-bind (fi ka kb a b) (fsp-keyed-session)
+    (let* ((nh (fips-make-xk-initiator kb (keypair-public-bytes ka) (octets 3 3 3 3 3 3 3 3)))
+           (m1 (natrium.noise:xk-write-message-1 nh))
+           (ack (fsp-handle-rekey-setup fi (subseq (encode-session-datagram b a (encode-fsp-setup-or-ack 1 0 (list b) (list a) m1)) 1))))
+      (natrium.noise:xk-read-message-2 nh (nth-value 4 (decode-fsp-setup-or-ack (fsp-rekey-ack-payload ack))))
+      (let* ((genuine (natrium.noise:xk-write-message-3 nh))
+             (forged (copy-seq genuine)))
+        (setf (aref forged 10) (logxor 1 (aref forged 10)))
+        (check "S2: a forged msg3 is refused"
+               (handler-case (progn (fsp-handle-rekey-msg3 fi (subseq (encode-session-datagram b a (encode-fsp-msg3 forged)) 1)) nil)
+                 (error () t)))
+        (check "S2: the genuine msg3 still completes after a forged one"
+               (fsp-handle-rekey-msg3 fi (subseq (encode-session-datagram b a (encode-fsp-msg3 genuine)) 1))))))
+  ;; S3: a forged SessionAck does not spend our initial handshake
+  (let* ((ka (generate-keypair)) (kb (generate-keypair))
+         (a (fsp-addr 10)) (b (fsp-addr 20))
+         (fi (make-fsp-initiator ka (keypair-public-bytes kb) (octets 1 1 1 1 1 1 1 1) a b (list a) (list b)))
+         (rh (fips-make-xk-responder kb (octets 2 2 2 2 2 2 2 2))))
+    (natrium.noise:xk-read-message-1 rh (nth-value 4 (decode-fsp-setup-or-ack
+                                                     (nth-value 4 (decode-session-datagram (subseq (fsp-setup-datagram fi) 1))))))
+    (let* ((m2 (natrium.noise:xk-write-message-2 rh))
+           (forged (copy-seq m2)))
+      (setf (aref forged 40) (logxor 1 (aref forged 40)))
+      (check "S3: a forged SessionAck is refused"
+             (handler-case (progn (fsp-handle-ack fi (subseq (encode-session-datagram b a (encode-fsp-setup-or-ack 2 0 (list b) (list a) forged)) 1)) nil)
+               (error () t)))
+      (check "S3: the genuine SessionAck still completes the handshake"
+             (and (fsp-handle-ack fi (subseq (encode-session-datagram b a (encode-fsp-setup-or-ack 2 0 (list b) (list a) m2)) 1))
+                  (eq (fsp-initiator-phase fi) :established)))))
+  ;; S4: a rekey handshake that never completes is abandoned after 30 s
+  (multiple-value-bind (fi) (fsp-keyed-session)
+    (fsp-start-rekey fi :now 1000)
+    (check "S4: a second rekey is refused while the first is fresh"
+           (handler-case (progn (fsp-start-rekey fi :now 20000) nil) (error () t)))
+    (check "S4: after 30 s the stale rekey is abandoned and a new one can start"
+           (handler-case (progn (fsp-start-rekey fi :now 32000) t) (error () nil))))
+  ;; S5: the K bit flips at each cutover, as upstream's current_k_bit does
+  (multiple-value-bind (fi ka kb a b) (fsp-keyed-session)
+    (declare (ignore ka))
+    (let ((k0 (fsp-initiator-k fi)))
+      (fsp-own-rekey-to-new fi kb a b 1000)
+      (let ((k1 (fsp-initiator-k fi)))
+        (fsp-own-rekey-to-new fi kb a b 50000)
+        (check "S5: the K bit flips at the first cutover and back at the second"
+               (and (not (eq k0 k1)) (eq (fsp-initiator-k fi) k0)))))))
+
 (defun test-fsp-session ()
   (test-session-datagram)
   (test-coords)
@@ -371,4 +446,5 @@
   (test-fsp-own-rekey)
   (test-fsp-resend-setup)
   (test-fsp-drain)
+  (test-fsp-adversarial)
   (test-fsp-wrong-peer))

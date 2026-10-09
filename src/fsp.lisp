@@ -107,6 +107,9 @@
 ;; upstream proto/fsp/limits.rs DRAIN_WINDOW_SECS = 10, and the hard cap of 12 windows
 ;; (node/handlers/rekey.rs DRAIN_MAX_RETENTION_SECS)
 (defconstant +fsp-drain-ms+ 10000)
+;; a rekey handshake not completed within this is abandoned (upstream's stale
+;; handshake rule, node.rate_limit.handshake_timeout_secs = 30)
+(defconstant +fsp-handshake-timeout-ms+ 30000)
 (defconstant +fsp-drain-max-ms+ 120000)
 
 (defun fsp-seal-data (session src-port dst-port data timestamp-ms &key coords k)
@@ -186,6 +189,7 @@
   last-msg3       ; the msg3 we last took, so a resend of it is not an error
   setup-datagram  ; our SessionSetup, kept so an unanswered one can be resent
   (setup-sent-at 0) (setup-tries 0)  ; when it was last sent, and how often
+  (pending-hs-at 0) (rekey-hs-at 0)  ; when each rekey handshake began (ms)
   (previous-started-ms 0)   ; when the drain began: the cutover (ms)
   (previous-last-used-ms 0)) ; the last frame that opened under the previous session
 
@@ -237,7 +241,8 @@
     (multiple-value-bind (phase flags src-coords dest-coords hs) (decode-fsp-setup-or-ack payload)
       (declare (ignore flags src-coords dest-coords))
       (unless (= phase 2) (error "expected SessionAck, got phase ~d" phase))
-      (natrium.noise:xk-read-message-2 (fsp-initiator-hs fi) hs)
+      ;; a forged ack must not spend the handshake the genuine one needs
+      (natrium.noise:xk-try-read-message-2 (fsp-initiator-hs fi) hs)
       (let* ((msg3 (natrium.noise:xk-write-message-3 (fsp-initiator-hs fi)))
              (ok (encode-fsp-msg3 msg3)))
         (setf (fsp-initiator-session fi)
@@ -261,7 +266,7 @@
 ;;; session is adopted when a frame first opens under it; the one it replaces is
 ;;; kept as the previous session for late frames.
 
-(defun fsp-handle-rekey-setup (fi datagram-body)
+(defun fsp-handle-rekey-setup (fi datagram-body &key (now 0))
   "Answer a SessionSetup that rekeys the established session.  Returns the
    SessionDatagram body that carries SessionAck (XK msg2)."
   (unless (eq (fsp-initiator-phase fi) :established)
@@ -279,10 +284,11 @@
         (let* ((msg2 (natrium.noise:xk-write-message-2 hs))
                (ack (encode-fsp-setup-or-ack 2 0 (fsp-initiator-our-coords fi)
                                              (fsp-initiator-peer-coords fi) msg2)))
-          (setf (fsp-initiator-pending-hs fi) hs)
+          (setf (fsp-initiator-pending-hs fi) hs
+                (fsp-initiator-pending-hs-at fi) now)
           (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi) ack))))))
 
-(defun fsp-handle-rekey-msg3 (fi datagram-body)
+(defun fsp-handle-rekey-msg3 (fi datagram-body &key (now 0))
   "Consume SessionMsg3 (XK msg3) of a rekey we answered.  The rekeyed session waits
    for its first authenticated frame before it takes over."
   (multiple-value-bind (src dest ttl mtu payload) (decode-session-datagram datagram-body)
@@ -295,31 +301,55 @@
         ((and (fsp-initiator-last-msg3 fi) (equalp msg3 (fsp-initiator-last-msg3 fi)))
          ;; the peer resends msg3 until a frame under the new session reaches it
          :duplicate)
-        ((null (fsp-initiator-pending-hs fi)) (error "no rekey is outstanding"))
+        ((progn (fsp-expire-handshakes fi now) (null (fsp-initiator-pending-hs fi)))
+         (error "no rekey is outstanding"))
         (t
          (let ((hs (fsp-initiator-pending-hs fi)))
-           (natrium.noise:xk-read-message-3 hs msg3)
+           ;; a msg3 that does not authenticate leaves the handshake as it was, so
+           ;; the genuine one still completes (upstream try_read_xk_message_3)
+           (natrium.noise:xk-try-read-message-3 hs msg3)
+           ;; the rekey must come from the peer the session was established with:
+           ;; compare x-only keys (session.rs, RekeyKeyMismatch).  The source
+           ;; address is not authenticated, so without this anyone could rekey the
+           ;; session to a key of their own.
+           (let ((rekeyed (secp256k1-fast.ecdh:encode-pubkey (natrium.noise:hs-remote-static hs))))
+             (unless (equalp (subseq rekeyed 1) (subseq (fsp-initiator-peer-static fi) 1))
+               (setf (fsp-initiator-pending-hs fi) nil)
+               (error "rekey static key differs from the peer's")))
            (setf (fsp-initiator-pending-session fi) (natrium.noise:handshake-into-session hs)
                  (fsp-initiator-pending-hs fi) nil
                  (fsp-initiator-last-msg3 fi) msg3)
            t))))))
+
+(defun fsp-expire-handshakes (fi now)
+  "Abandon a rekey handshake that has been open longer than the timeout.  The
+   deadline runs from its start and a failed read does not restamp it, so forged
+   packets cannot hold a handshake open."
+  (when (and (fsp-initiator-pending-hs fi)
+             (> (- now (fsp-initiator-pending-hs-at fi)) +fsp-handshake-timeout-ms+))
+    (setf (fsp-initiator-pending-hs fi) nil))
+  (when (and (fsp-initiator-rekey-hs fi)
+             (> (- now (fsp-initiator-rekey-hs-at fi)) +fsp-handshake-timeout-ms+))
+    (setf (fsp-initiator-rekey-hs fi) nil)))
 
 ;;; --- A rekey we start ---------------------------------------------------------
 ;;; SessionSetup (XK msg1) on the established session, the peer's SessionAck
 ;;; (msg2), our SessionMsg3 (msg3).  The new session takes over on our first frame
 ;;; under it, which carries the K bit; the peer switches when it sees that frame.
 
-(defun fsp-start-rekey (fi)
+(defun fsp-start-rekey (fi &key (now 0))
   "Begin a rekey of the established session.  Returns the SessionDatagram link
    message that carries SessionSetup (XK msg1)."
   (unless (eq (fsp-initiator-phase fi) :established) (error "a rekey needs an established session"))
+  (fsp-expire-handshakes fi now)
   (when (fsp-initiator-rekey-hs fi) (error "a rekey is already in flight"))
   (let* ((hs (fips-make-xk-initiator (fsp-initiator-static fi) (fsp-initiator-peer-static fi)
                                      (fsp-initiator-local-epoch fi)))
          (msg1 (natrium.noise:xk-write-message-1 hs))
          (setup (encode-fsp-setup-or-ack 1 0 (fsp-initiator-our-coords fi)
                                          (fsp-initiator-peer-coords fi) msg1)))
-    (setf (fsp-initiator-rekey-hs fi) hs)
+    (setf (fsp-initiator-rekey-hs fi) hs
+          (fsp-initiator-rekey-hs-at fi) now)
     (encode-session-datagram (fsp-initiator-our-addr fi) (fsp-initiator-peer-addr fi) setup)))
 
 (defun fsp-handle-rekey-ack (fi datagram-body)
@@ -335,7 +365,8 @@
       (declare (ignore flags src-c dest-c))
       (unless (= phase 2) (error "expected SessionAck, got phase ~d" phase))
       (let ((hs (fsp-initiator-rekey-hs fi)))
-        (natrium.noise:xk-read-message-2 hs msg2)
+        ;; a forged ack leaves the rekey as it was
+        (natrium.noise:xk-try-read-message-2 hs msg2)
         (let ((msg3 (natrium.noise:xk-write-message-3 hs)))
           (setf (fsp-initiator-pending-session fi) (natrium.noise:handshake-into-session hs)
                 (fsp-initiator-rekey-hs fi) nil
@@ -374,7 +405,8 @@
           (fsp-initiator-session fi) (fsp-initiator-pending-session fi)
           (fsp-initiator-pending-session fi) nil
           (fsp-initiator-rekey-initiator-p fi) nil
-          (fsp-initiator-k fi) t)
+          ;; the K bit names the epoch: it flips at every cutover (session/mod.rs)
+          (fsp-initiator-k fi) (not (fsp-initiator-k fi)))
     (fsp-begin-drain fi now)))
 
 (defun fsp-open-any (fi wire &key (now 0))
@@ -385,6 +417,7 @@
    in ms.  Returns the values FSP-OPEN-DATA returns; a frame that opens under none
    of them is refused."
   (fsp-expire-previous fi now)
+  (fsp-expire-handshakes fi now)
   (let ((cur (fsp-initiator-session fi))
         (pend (fsp-initiator-pending-session fi))
         (prev (and (fsp-previous-live-p fi now) (fsp-initiator-previous-session fi))))
@@ -399,7 +432,9 @@
           (setf (fsp-initiator-previous-session fi) cur
                 (fsp-initiator-session fi) pend
                 (fsp-initiator-pending-session fi) nil
-                (fsp-initiator-k fi) t)
+                ;; whoever started the rekey, the cutover is done now
+                (fsp-initiator-rekey-initiator-p fi) nil
+                (fsp-initiator-k fi) (not (fsp-initiator-k fi)))
           (fsp-begin-drain fi now)
           (return-from fsp-open-any (values-list opened))))
       (let ((opened (try prev)))

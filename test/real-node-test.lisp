@@ -199,7 +199,7 @@
                  (eq (cl-fips:fsp-initiator-phase fsp) :established)
                  (>= (- (ms) t0) (* 1000 rekey-at)))
         (setf rekey-started t)
-        (cl-fips:stream-link-send link (cl-fips:fsp-start-rekey fsp))
+        (cl-fips:stream-link-send link (cl-fips:fsp-start-rekey fsp :now (ms)))
         (out "~6d FSP rekey: SessionSetup sent (ours)" (- (ms) t0)))
       (when (and fsp (eq (cl-fips:fsp-initiator-phase fsp) :established) (>= (ms) next-data))
         (incf data-count)
@@ -265,11 +265,11 @@
                                  (- (ms) t0))))
                          ((= (cl-fips:prefix-phase payload) 1)
                           ;; the node rekeys the FSP session: answer its msg1 with SessionAck
-                          (let ((reply (cl-fips:fsp-handle-rekey-setup fsp (subseq m 1))))
+                          (let ((reply (cl-fips:fsp-handle-rekey-setup fsp (subseq m 1) :now (ms))))
                             (cl-fips:stream-link-send link reply)
                             (out "~6d FSP rekey: SessionSetup answered with SessionAck" (- (ms) t0))))
                          ((= (cl-fips:prefix-phase payload) 3)
-                          (cl-fips:fsp-handle-rekey-msg3 fsp (subseq m 1))
+                          (cl-fips:fsp-handle-rekey-msg3 fsp (subseq m 1) :now (ms))
                           (out "~6d FSP rekey: SessionMsg3 taken; the new session waits for its first frame"
                                (- (ms) t0)))
                          ((zerop (cl-fips:prefix-phase payload))
