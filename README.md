@@ -25,7 +25,9 @@ A Lisp node can:
   node's announcements;
 - complete a Noise XK session (the session layer) with a node, carry
   DataPackets both ways, and rekey that session in both directions;
-- send a DataPacket to a node two hops away, through a relay node.
+- send a DataPacket to a node two hops away, through a relay node;
+- act as a middle node: forward SessionDatagrams between two peers, so that two
+  nodes that are not peers of each other can carry a session through it.
 
 Every one of these has been checked against the real upstream `fips` binary,
 not only against our own oracle. See [Real-node results](#real-node-results).
@@ -44,6 +46,7 @@ not only against our own oracle. See [Real-node results](#real-node-results).
 | `src/bloom.lisp` | The reachability filter and the FilterAnnounce codec |
 | `src/tree.lisp` | Our spanning-tree declaration, from the peers' verified announces |
 | `src/fsp.lisp` | The end-to-end session: SessionDatagram, the XK handshake bodies, DataPacket frames, rekey, drain |
+| `src/route.lisp` | Transit forwarding: TTL and path MTU for a SessionDatagram, the next hop from peers' filters, split horizon |
 | `src/identity.lisp` | `node_addr` and the FIPS IPv6 address |
 | `transport/tcp.lisp` | The TCP adapter (`usocket`, SBCL only) |
 | `tools/oracle/` | A Rust crate that vendors upstream's Noise and framing code, for interop tests (test tooling only) |
@@ -83,6 +86,7 @@ then:
 ```sh
 FIPS_BIN=/path/to/fips scripts/run-real-node.sh 150
 FIPS_BIN=/path/to/fips ECHO_BIN=/path/to/native-echo scripts/run-real-node-multihop.sh 60
+FIPS_BIN=/path/to/fips ECHO_BIN=/path/to/native-echo SEND_BIN=/path/to/native-send scripts/run-real-node-transit.sh 90
 ```
 
 `native-echo` is upstream's `examples/native-echo`, built beside the binary. It
@@ -124,22 +128,28 @@ these come from):
   and the datagram reaches us, byte for byte.
 - **Rekey, both directions.** The node rekeys our FSP session and we answer; we
   rekey its session and it completes. The node logs the cutover in both cases.
+- **Transit.** Node A to Lisp to node B. Lisp forwards 241 SessionDatagrams,
+  B establishes a session from A, and its echo returns A's probe through Lisp.
 - **Two hops.** Lisp to relay A to node B. B establishes the session through A,
   and its echo returns 12 of 12 probes byte for byte.
 
 ## Not implemented
 
-- **Transit forwarding.** We are an endpoint. We do not forward SessionDatagrams
-  for other peers.
-- **Our own coordinate caching.** We send `[destination]` as the destination's
-  coordinates when we have no better path. We do not learn the real ancestry.
+- **Upstream's coordinate tie-break in routing.** A transit node forwards by its
+  peers' bloom filters only. Upstream also weighs tree distance, and it returns
+  error signals to a source it cannot route for. We ignore those signals.
+- **Coordinate discovery.** We send `[destination]` as the destination's
+  coordinates when we have no better path, and we do not run upstream's lookup.
+  A node learns a destination's coordinates from a SessionSetup that passes
+  through it, which is how the transit test works.
 - **Retransmission** of our link msg1 (the node does retransmit its own).
   Our SessionSetup is resent every 4 s, up to 10 times.
 - **Reading the peers' filters** for routing decisions, and parent hysteresis,
   flap dampening and cost-based parent choice.
 - **Path-MTU exchange and fragmentation.** A DataPacket larger than about 1290 bytes
   is refused locally.
-- **Multi-relay and route-change tests.** The two-hop test has one relay.
+- **Multi-relay and route-change tests.** The two-hop test has one relay, and the
+  transit test has one middle node.
 - **Running on modus.** The protocol code is written to be portable, but nothing
   has been run on modus. The tests use `sb-ext`, and the transport uses `usocket`.
 

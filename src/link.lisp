@@ -145,7 +145,9 @@
   tree                          ; a TREE-STATE, or NIL when routing is off
   (tree-dirty nil)              ; a peer announce arrived: recompute before sending
   (announce-due-ms nil)         ; when the next TreeAnnounce + FilterAnnounce is due
-  (filter-seq 0))
+  (filter-seq 0)
+  (peer-filter nil)             ; the last FilterAnnounce the peer sent us, as a bloom
+  (filter-source nil))          ; NIL: send our own address only; else (link) -> bloom
 
 (defun stream-link-session (link) (link-session (stream-link-fmp link)))
 (defun stream-link-our-index (link) (link-our-index (stream-link-fmp link)))
@@ -180,8 +182,12 @@
          (remote (secp256k1-fast.ecdh:encode-pubkey (natrium.noise:hs-remote-static hs)))
          (epoch (natrium.noise:hs-remote-epoch hs))
          (session (natrium.noise:handshake-into-session hs))
+         ;; ROUTING is T (a tree of this link's own), or a TREE-STATE shared by every
+         ;; link of a node that has more than one peer.  A node presents one tree.
          (tree (when routing
-                 (let ((st (make-tree-state (secp256k1-fast.ecdh:keypair-secret static))))
+                 (let ((st (if (tree-state-p routing)
+                               routing
+                               (make-tree-state (secp256k1-fast.ecdh:keypair-secret static)))))
                    ;; the peer's key came from the handshake, so its node_addr is known
                    (tree-register-peer-key st (node-addr remote) (subseq remote 1))
                    st))))
@@ -306,14 +312,19 @@
 
 (defun %handle-routing (link msg)
   "A peer's TreeAnnounce updates our tree state, and our announce is recomputed
-   on the next poll.  Malformed or unverified announces are ignored, as upstream
-   drops them; they do not close the link."
+   on the next poll.  A FilterAnnounce replaces the peer's reachability filter.
+   Malformed or unverified announces are ignored, as upstream drops them; they do
+   not close the link."
   (let ((tree (stream-link-tree link)))
     (when (and tree (plusp (length msg)) (= (aref msg 0) +tree-announce-msg-type+))
       (handler-case
           (multiple-value-bind (decl entries) (decode-tree-announce (subseq msg 1))
             (when (tree-observe-announce tree decl entries)
               (setf (stream-link-tree-dirty link) t)))
+        (error () nil)))
+    (when (and (plusp (length msg)) (= (aref msg 0) +filter-announce-msg-type+))
+      (handler-case
+          (setf (stream-link-peer-filter link) (nth-value 1 (decode-filter-announce (subseq msg 1))))
         (error () nil)))))
 
 (defun %unix-seconds ()
@@ -326,8 +337,11 @@
   (let ((tree (stream-link-tree link)))
     (tree-recompute tree unix-seconds)
     (stream-link-send link (tree-current-announce tree) :now-ms now-ms)
-    (let ((filter (make-bloom)))
-      (bloom-insert filter (tree-state-node tree))
+    (let ((filter (if (stream-link-filter-source link)
+                      (funcall (stream-link-filter-source link) link)
+                      (let ((own (make-bloom)))
+                        (bloom-insert own (tree-state-node tree))
+                        own))))
       (incf (stream-link-filter-seq link))
       (stream-link-send link (encode-filter-announce (stream-link-filter-seq link) filter)
                         :now-ms now-ms))

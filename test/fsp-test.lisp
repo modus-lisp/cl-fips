@@ -361,7 +361,7 @@
            (handler-case (progn (fsp-open-any fi (fsp-seal-data rs-old 0 3 (ascii-octets "cap") 99) :now 121000) nil)
              (natrium.noise:noise-error () t)))))
 
-(defun test-fsp ()
+(defun test-fsp-session ()
   (test-session-datagram)
   (test-coords)
   (test-fsp-bodies)

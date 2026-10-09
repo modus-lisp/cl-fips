@@ -26,6 +26,7 @@
                              (:file "bloom")
                              (:file "tree")
                              (:file "fsp")
+                             (:file "route")
                              (:file "link"))))
   :in-order-to ((test-op (test-op "cl-fips/test"))))
 
@@ -40,6 +41,7 @@
                              (:file "mmp-test")
                              (:file "routing-test")
                              (:file "fsp-test")
+                             (:file "transit-test")
                              (:file "link-test"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-fips.test '#:run-all)))
 

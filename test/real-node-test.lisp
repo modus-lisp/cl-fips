@@ -372,8 +372,161 @@
       (out "~:[FAIL~;PASS~] ~(~a~)" ok role)
       (sb-ext:exit :code (if ok 0 1)))))
 
-(let ((args (rest sb-ext:*posix-argv*)))
-  (destructuring-bind (mode dir &optional port secs) args
-    (cond ((string= mode "keygen") (keygen dir))
-          (t (run-link dir (if (string= mode "accept") :accept :dial)
+(defun keygen-root (dir)
+  "keygen, then a node B (DIR/b/node.key) whose node_addr is the smallest of the
+   three, so B is the root of the tree and every node can route to it."
+  (keygen dir)
+  (ensure-directories-exist (format nil "~a/b/" dir))
+  (keygen (format nil "~a/b" dir))
+  (let* ((a (cl-fips:node-addr (second (read-key (format nil "~a/node.key" dir)))))
+         (l (cl-fips:node-addr (second (read-key (format nil "~a/lisp.key" dir)))))
+         (least (if (bytes< a l) a l)))
+    (loop
+      (let* ((kp (cl-fips:generate-keypair))
+             (addr (cl-fips:node-addr (secp256k1-fast.ecdh:keypair-public-bytes kp))))
+        (when (bytes< addr least)
+          (write-key (format nil "~a/b/node.key" dir) kp)
+          (with-open-file (o (format nil "~a/b/node.npub" dir) :direction :output :if-exists :supersede)
+            (write-line (npub (secp256k1-fast.ecdh:keypair-public-bytes kp)) o))
+          (return))))))
+
+(defun bytes< (a b)
+  (loop for x across a for y across b
+        do (cond ((< x y) (return t)) ((> x y) (return nil)))
+        finally (return nil)))
+
+(defstruct transit-state
+  l1 l2 own b-addr static node-b fi (primed nil) (fwd 0) (no-route 0) (ttl 0) (local 0) (t0 0))
+
+(defun transit-filters (ts)
+  (list (cons (transit-state-l1 ts) (cl-fips:stream-link-peer-filter (transit-state-l1 ts)))
+        (cons (transit-state-l2 ts) (cl-fips:stream-link-peer-filter (transit-state-l2 ts)))))
+
+(defun transit-forward (ts link body)
+  "A SessionDatagram that is not for us: next hop from the peers' filters, TTL down
+   by one, path_mtu capped at the outgoing MTU."
+  (let* ((dest (cl-fips:sd-dest body))
+         (target (cl-fips:route-next-hop (transit-filters ts) link dest)))
+    (if (null target)
+        (incf (transit-state-no-route ts))
+        (let ((out-body (cl-fips:sd-forward-header body 1400)))
+          (cond
+            ((null out-body) (incf (transit-state-ttl ts)))
+            (t
+             (cl-fips:stream-link-send target
+                                       (concatenate '(vector (unsigned-byte 8))
+                                                    (vector #x00) out-body))
+             (incf (transit-state-fwd ts))
+             (when (<= (transit-state-fwd ts) 6)
+               (out "~6d FORWARD datagram ttl=~d (to ~:[B~;A~])"
+                    (- (ms) (transit-state-t0 ts)) (cl-fips:sd-ttl out-body)
+                    (eq target (transit-state-l1 ts))))))))))
+
+(defun transit-local (ts link body)
+  "A SessionDatagram for us.  Our SessionAck (from B) completes the session we
+   primed.  Anything else addressed to us -- an error signal a transit node sends
+   back to a source it could not route for, such as A -- is logged and ignored."
+  (incf (transit-state-local ts))
+  (let ((fi (transit-state-fi ts)))
+    (cond
+      ((and fi (eq (cl-fips:fsp-initiator-phase fi) :setup-sent)
+            (equalp (cl-fips:sd-src body) (transit-state-b-addr ts)))
+       (cl-fips:stream-link-send link (cl-fips:fsp-handle-ack fi body))
+       (out "~6d FSP session with B established through the middle"
+            (- (ms) (transit-state-t0 ts))))
+      (t
+       (out "~6d local SessionDatagram from ~a ignored (not our peer's SessionAck)"
+            (- (ms) (transit-state-t0 ts))
+            (hex (cl-fips:sd-src body)))))))
+
+(defun transit-receive (ts link)
+  (handler-case
+      (let ((m (cl-fips:stream-link-receive link :timeout-ms 2000)))
+        ;; the tree is shared: a change learned on one link changes both announces
+        (setf (cl-fips:stream-link-tree-dirty (transit-state-l1 ts)) t
+              (cl-fips:stream-link-tree-dirty (transit-state-l2 ts)) t)
+        (when (and m (= (aref m 0) #x00))
+          (let ((body (subseq m 1)))
+            (if (equalp (cl-fips:sd-dest body) (transit-state-own ts))
+                (transit-local ts link body)
+                (transit-forward ts link body)))))
+    (cl-fips:link-error (e) (out "~6d link error: ~a" (- (ms) (transit-state-t0 ts)) e))
+    (error (e) (out "~6d FAIL: ~a" (- (ms) (transit-state-t0 ts)) e))))
+
+(defun transit-prime (ts)
+  "Once our coordinates exist, one SessionSetup toward B goes out through A."
+  (let* ((l1 (transit-state-l1 ts))
+         (tree (cl-fips:stream-link-tree l1)))
+    (when (and (not (transit-state-primed ts)) tree (cl-fips:tree-state-entries tree))
+      (let ((fi (cl-fips:make-fsp-initiator
+                 (transit-state-static ts) (second (transit-state-node-b ts))
+                 (natrium:random-bytes 8) (transit-state-own ts) (transit-state-b-addr ts)
+                 (mapcar #'cl-fips:coord-entry-node (cl-fips:tree-state-entries tree))
+                 (list (transit-state-b-addr ts)))))
+        (setf (transit-state-fi ts) fi
+              (transit-state-primed ts) t)
+        (cl-fips:stream-link-send l1 (cl-fips:fsp-setup-datagram fi (ms)))
+        (out "~6d SessionSetup toward B sent through A" (- (ms) (transit-state-t0 ts)))))))
+
+(defun run-transit (dir port-a port-l secs)
+  "Lisp as the MIDDLE node: a link to relay A (dialled), and a link B dials into
+   (accepted).  Frames are forwarded between the two.  Once, a SessionSetup toward
+   B goes out through A, so A learns B's coordinates from it and can route to B."
+  (let* ((lisp (read-key (format nil "~a/lisp.key" dir)))
+         (static (secp256k1-fast.ecdh:keypair-from-secret (first lisp)))
+         (node-a (read-key (format nil "~a/node.key" dir)))
+         (node-b (read-key (format nil "~a/b/node.key" dir)))
+         (own (cl-fips:node-addr (secp256k1-fast.ecdh:keypair-public-bytes static)))
+         (epoch (natrium:random-bytes 8))
+         (s1 (usocket:socket-connect "127.0.0.1" port-a :element-type '(unsigned-byte 8)
+                                                        :nodelay t :timeout 10))
+         ;; one tree for the node, shared by both links: it sees both peers' announces
+         (tree (cl-fips:make-tree-state (secp256k1-fast.ecdh:keypair-secret static)))
+         (l1 (cl-fips:stream-link-initiate (cl-fips.transport:socket-byte-port s1) static
+                                           (second node-a) epoch :timeout-ms 10000 :routing tree))
+         (listener (usocket:socket-listen "127.0.0.1" port-l :reuse-address t
+                                                             :element-type '(unsigned-byte 8))))
+    (out "HANDSHAKE OK role=dial (to A)")
+    (out "LISTENING 127.0.0.1:~d" port-l)
+    (unless (usocket:wait-for-input listener :timeout 120 :ready-only t)
+      (out "FAIL: B never dialled in") (sb-ext:exit :code 1))
+    (let* ((s2 (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
+           (l2 (cl-fips:stream-link-accept (cl-fips.transport:socket-byte-port s2) static epoch
+                                           :timeout-ms 10000 :routing tree))
+           (ts (make-transit-state :l1 l1 :l2 l2 :own own :static static :node-b node-b
+                                   :b-addr (cl-fips:node-addr (second node-b)) :t0 (ms))))
+      (usocket:socket-close listener)
+      (out "HANDSHAKE OK role=accept (from B)")
+      (setf (cl-fips:stream-link-filter-source l1) (lambda (l) (cl-fips:route-filter-for own (transit-filters ts) l))
+            (cl-fips:stream-link-filter-source l2) (lambda (l) (cl-fips:route-filter-for own (transit-filters ts) l)))
+      (let ((next-hb 0) (deadline (+ (ms) (* 1000 secs))))
+        (loop while (< (ms) deadline) do
+          (when (>= (ms) next-hb)
+            (cl-fips:stream-link-send l1 (coerce #(#x51) '(vector (unsigned-byte 8))))
+            (cl-fips:stream-link-send l2 (coerce #(#x51) '(vector (unsigned-byte 8))))
+            (setf next-hb (+ (ms) 5000)))
+          (cl-fips:stream-link-poll l1)
+          (cl-fips:stream-link-poll l2)
+          (transit-prime ts)
+          (let ((fi (transit-state-fi ts)))
+            (when fi
+              (let ((again (cl-fips:fsp-resend-setup fi (ms))))
+                (when again (cl-fips:stream-link-send l1 again)))))
+          (dolist (sock (usocket:wait-for-input (list s1 s2) :timeout 0.1 :ready-only t))
+            (transit-receive ts (if (eq sock s1) l1 l2))))
+        (out "TRANSIT forwarded=~d dropped-no-route=~d dropped-ttl=~d local=~d primed=~:[no~;yes~]"
+             (transit-state-fwd ts) (transit-state-no-route ts) (transit-state-ttl ts)
+             (transit-state-local ts) (transit-state-primed ts))
+        (cl-fips:stream-link-close l1)
+        (cl-fips:stream-link-close l2)
+        (sb-ext:exit :code 0)))))
+
+(let* ((args (rest sb-ext:*posix-argv*)) (mode (first args)))
+  (cond ((string= mode "keygen") (keygen (second args)))
+        ((string= mode "keygen-root") (keygen-root (second args)))
+        ((string= mode "transit")
+         (run-transit (second args) (parse-integer (third args))
+                      (parse-integer (fourth args)) (parse-integer (or (fifth args) "60"))))
+        (t (destructuring-bind (mode dir &optional port secs) args
+             (run-link dir (if (string= mode "accept") :accept :dial)
                        (parse-integer port) (parse-integer (or secs "20")))))))
