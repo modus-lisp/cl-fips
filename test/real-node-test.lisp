@@ -92,6 +92,12 @@
     (with-open-file (o (format nil "~a/node.addr" dir) :direction :output :if-exists :supersede)
       (write-line (hex (cl-fips:node-addr (secp256k1-fast.ecdh:keypair-public-bytes node))) o))))
 
+(defun routing-mode ()
+  "CL_FIPS_ROUTING: unset or \"on\" = send our TreeAnnounce and FilterAnnounce
+   (the default); \"off\" = none (the negative control)."
+  (let ((v (sb-ext:posix-getenv "CL_FIPS_ROUTING")))
+    (not (equal v "off"))))
+
 (defun reports-mode ()
   "CL_FIPS_REPORTS: unset or \"all\" = SenderReport + ReceiverReport (default),
    \"no-rr\" = SenderReport only (the negative control), \"off\" = none."
@@ -186,9 +192,9 @@
       (handler-case
           (setf link (if (eq role :accept)
                          (cl-fips:stream-link-accept port static epoch :timeout-ms 10000
-                                                     :reports (reports-mode))
+                                                     :reports (reports-mode) :routing (routing-mode))
                          (cl-fips:stream-link-initiate port static (second node) epoch
-                                                       :timeout-ms 10000 :reports (reports-mode))))
+                                                       :timeout-ms 10000 :reports (reports-mode) :routing (routing-mode))))
         (error (e) (out "FAIL: handshake: ~a" e) (sb-ext:exit :code 1))))
     (out "REPORTS mode=~(~a~)" (reports-mode))
     (out "HANDSHAKE OK role=~(~a~) our_index=~8,'0x their_index=~8,'0x remote_epoch=~a"

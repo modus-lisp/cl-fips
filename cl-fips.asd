@@ -22,6 +22,9 @@
                              (:file "identity")
                              (:file "rekey")
                              (:file "mmp")
+                             (:file "stp")
+                             (:file "bloom")
+                             (:file "tree")
                              (:file "link"))))
   :in-order-to ((test-op (test-op "cl-fips/test"))))
 
@@ -34,6 +37,7 @@
                              (:file "try-read-test")
                              (:file "rekey-test")
                              (:file "mmp-test")
+                             (:file "routing-test")
                              (:file "link-test"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-fips.test '#:run-all)))
 

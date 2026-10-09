@@ -72,6 +72,23 @@ check_node_log() {  # $1 arm, $2 log
   un=$(grep -c "Resending unconfirmed" "$2")
   if [ "$un" -eq 0 ]; then echo "  node: no unconfirmed TreeAnnounce/FilterAnnounce resent (run ${SECS}s; the fallback is 30 s)"
   else echo "  FAIL: node resent $un unconfirmed announces"; grep "Resending unconfirmed" "$2" | sed 's/^/    /' | cut -c1-200; fail=1; fi
+  # Routing (CL_FIPS_ROUTING, on by default): the node must accept our
+  # TreeAnnounce as a verified, semantically valid declaration, and our
+  # FilterAnnounce as coming from a tree peer.
+  if [ "${CL_FIPS_ROUTING:-on}" != "off" ]; then
+    # the node logs npubs abbreviated as first-9 "..." last-4
+    np=$(cat "$DIR/lisp.npub" 2>/dev/null)
+    ab="$(printf %s "$np" | cut -c1-9)...$(printf %s "$np" | tail -c 4)"
+    # the node names the peer by its npub, or by the alias in its config ("cl-fips")
+    if grep -qE "Processed TreeAnnounce from=($ab|cl-fips) " "$2"; then
+      echo "  node: processed our TreeAnnounce (signature and ancestry accepted)"
+    else echo "  FAIL: node did not process a TreeAnnounce from Lisp"; fail=1; fi
+    if grep -qE "Received FilterAnnounce from=($ab|cl-fips) .*tree_peer=true" "$2"; then
+      echo "  node: received our FilterAnnounce from a tree peer"
+    else echo "  FAIL: node did not record our FilterAnnounce as a tree peer's"; fail=1; fi
+  else
+    if grep -q "Resending unconfirmed TreeAnnounce" "$2"; then echo "  (routing off: node resends TreeAnnounce as expected)"; fi
+  fi
   if grep -qE "Removing peer|Peer removed" "$2"; then echo "  FAIL: node removed the peer"; fail=1
   else echo "  node: never removed the peer"; fi
   if grep -q "FMP rekey aborted" "$2"; then echo "  FAIL: node aborted an FMP rekey"; fail=1; fi

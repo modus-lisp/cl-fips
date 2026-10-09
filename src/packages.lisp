@@ -11,6 +11,19 @@
            ;; the FIPS suite (fips-noise.lisp); the protocol is natrium.noise's
            #:generate-keypair #:normalize-for-premessage
            #:fips-make-ik-initiator #:fips-make-ik-responder
+           ;; spanning tree (stp.lisp, tree.lisp) and bloom filter (bloom.lisp)
+           #:+tree-announce-msg-type+ #:+filter-announce-msg-type+
+           #:make-coord-entry #:coord-entry-node #:coord-entry-seq #:coord-entry-ts
+           #:make-parent-declaration #:parent-declaration-node #:parent-declaration-parent
+           #:parent-declaration-seq #:parent-declaration-ts #:parent-declaration-sig
+           #:parent-declaration-root-p #:declaration-signing-bytes #:declaration-signing-hash
+           #:sign-declaration #:verify-declaration
+           #:encode-tree-announce #:decode-tree-announce #:validate-tree-semantics
+           #:make-tree-state #:tree-state-node #:tree-state-declaration #:tree-state-entries
+           #:tree-register-peer-key #:tree-observe-announce #:tree-recompute
+           #:tree-current-announce
+           #:make-bloom #:bloom-bit-indices #:bloom-insert #:bloom-contains-p
+           #:bloom-union #:encode-filter-announce #:decode-filter-announce
            #:fips-make-xk-initiator #:fips-make-xk-responder
            ;; FMP established frames (fmp.lisp)
            #:+flag-key-epoch+ #:+flag-ce+ #:+flag-sp+ #:+inner-header-size+

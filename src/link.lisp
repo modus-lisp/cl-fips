@@ -140,7 +140,12 @@
 
 (defstruct (stream-link (:constructor %make-stream-link))
   port role fmp mmp handshake-hash remote-static remote-epoch
-  (mtu +default-stream-mtu+) timeout-ms (started 0) (state :established))
+  (mtu +default-stream-mtu+) timeout-ms (started 0) (state :established)
+  ;; routing (optional): our spanning-tree declaration and our reachability filter
+  tree                          ; a TREE-STATE, or NIL when routing is off
+  (tree-dirty nil)              ; a peer announce arrived: recompute before sending
+  (announce-due-ms nil)         ; when the next TreeAnnounce + FilterAnnounce is due
+  (filter-seq 0))
 
 (defun stream-link-session (link) (link-session (stream-link-fmp link)))
 (defun stream-link-our-index (link) (link-our-index (stream-link-fmp link)))
@@ -170,12 +175,18 @@
                  :send-sr (and (member reports '(t :no-rr)) t)))
 
 (defun %finish-link (port role hs our their mtu timeout-ms static local-epoch
-                     rekey-config jitter-fn reports)
+                     rekey-config jitter-fn reports routing)
   (let* ((hash (natrium.noise:handshake-hash hs))
          (remote (secp256k1-fast.ecdh:encode-pubkey (natrium.noise:hs-remote-static hs)))
          (epoch (natrium.noise:hs-remote-epoch hs))
-         (session (natrium.noise:handshake-into-session hs)))
+         (session (natrium.noise:handshake-into-session hs))
+         (tree (when routing
+                 (let ((st (make-tree-state (secp256k1-fast.ecdh:keypair-secret static))))
+                   ;; the peer's key came from the handshake, so its node_addr is known
+                   (tree-register-peer-key st (node-addr remote) (subseq remote 1))
+                   st))))
     (%make-stream-link
+     :tree tree
      :port port :role role :handshake-hash hash :remote-static remote :remote-epoch epoch
      :fmp (make-link session our their :static static :peer-static-bytes remote
                                        :local-epoch local-epoch :remote-epoch epoch :now-ms 0
@@ -188,7 +199,7 @@
 (defun stream-link-initiate (port static remote-static-bytes local-epoch
                              &key (our-index (random-session-index))
                                (mtu +default-stream-mtu+) timeout-ms
-                               rekey-config jitter-fn (reports t))
+                               rekey-config jitter-fn (reports t) routing)
   "IK initiator on PORT: write msg1, read msg2.  Returns an established STREAM-LINK.
    REKEY-CONFIG / JITTER-FN configure the rekey machine (stock: 120 s, no
    jitter); REPORTS selects the MMP reports STREAM-LINK-POLL emits."
@@ -203,12 +214,12 @@
         (%noise-or-fail (port :handshake-failed)
           (natrium.noise:ik-read-message-2 hs noise-msg2))
         (%finish-link port :initiator hs our-index their-index mtu timeout-ms
-                      static local-epoch rekey-config jitter-fn reports)))))
+                      static local-epoch rekey-config jitter-fn reports routing)))))
 
 (defun stream-link-accept (port static local-epoch
                            &key (our-index (random-session-index))
                              (mtu +default-stream-mtu+) timeout-ms
-                             rekey-config jitter-fn (reports t))
+                             rekey-config jitter-fn (reports t) routing)
   "IK responder on PORT: read msg1, write msg2.  Returns an established STREAM-LINK."
   (let* ((hs (fips-make-ik-responder static local-epoch))
          (packet (%handshake-packet port +phase-msg1+ mtu timeout-ms)))
@@ -219,7 +230,7 @@
       (let ((noise-msg2 (natrium.noise:ik-write-message-2 hs)))
         (write-fmp-packet port (build-msg2 our-index their-index noise-msg2))
         (%finish-link port :responder hs our-index their-index mtu timeout-ms
-                      static local-epoch rekey-config jitter-fn reports)))))
+                      static local-epoch rekey-config jitter-fn reports routing)))))
 
 (defun stream-link-elapsed-ms (link)
   (floor (* 1000 (- (get-internal-real-time) (stream-link-started link)))
@@ -283,6 +294,7 @@
              (mmp-receiver-record (mmp-receiver mmp) counter ts (length wire)
                                   (logtest flags +flag-ce+) now))
            (mmp-handle-report mmp msg (%session-ms link now))
+           (%handle-routing link msg)
            (values msg ts flags counter slot)))
         (:msg2 (write-fmp-packet port a) (values nil :rekey-answered))
         (:rekey-complete (values nil :rekey-complete))
@@ -290,7 +302,39 @@
                           (format nil "phase 0x~x packet dropped: ~(~a~)" (prefix-phase wire) a)
                           nil))))))
 
-(defun stream-link-poll (link &key now-ms)
+(defconstant +routing-interval-ms+ 10000)
+
+(defun %handle-routing (link msg)
+  "A peer's TreeAnnounce updates our tree state, and our announce is recomputed
+   on the next poll.  Malformed or unverified announces are ignored, as upstream
+   drops them; they do not close the link."
+  (let ((tree (stream-link-tree link)))
+    (when (and tree (plusp (length msg)) (= (aref msg 0) +tree-announce-msg-type+))
+      (handler-case
+          (multiple-value-bind (decl entries) (decode-tree-announce (subseq msg 1))
+            (when (tree-observe-announce tree decl entries)
+              (setf (stream-link-tree-dirty link) t)))
+        (error () nil)))))
+
+(defun %unix-seconds ()
+  (- (get-universal-time) 2208988800))
+
+(defun %send-routing (link now-ms unix-seconds)
+  "Recompute our declaration, then send our TreeAnnounce and FilterAnnounce.  Our
+   reachability filter holds our own node_addr only: a leaf with one peer has
+   nothing else behind it."
+  (let ((tree (stream-link-tree link)))
+    (tree-recompute tree unix-seconds)
+    (stream-link-send link (tree-current-announce tree) :now-ms now-ms)
+    (let ((filter (make-bloom)))
+      (bloom-insert filter (tree-state-node tree))
+      (incf (stream-link-filter-seq link))
+      (stream-link-send link (encode-filter-announce (stream-link-filter-seq link) filter)
+                        :now-ms now-ms))
+    (setf (stream-link-tree-dirty link) nil
+          (stream-link-announce-due-ms link) (+ now-ms +routing-interval-ms+))))
+
+(defun stream-link-poll (link &key now-ms unix-seconds)
   "The periodic tick: the rekey decision (cutover, drain, retire, initiate --
    a msg1 is written here), then any MMP report that is due.  Returns
    (values rekey-actions report-msg-types)."
@@ -303,6 +347,13 @@
       (dolist (m (mmp-due-reports mmp now))
         (stream-link-send link m :now-ms now)
         (push (aref m 0) sent))
+      (when (and (stream-link-tree link)
+                 (or (null (stream-link-announce-due-ms link))
+                     (>= now (stream-link-announce-due-ms link))
+                     (stream-link-tree-dirty link)))
+        (%send-routing link now (or unix-seconds (%unix-seconds)))
+        (push +tree-announce-msg-type+ sent)
+        (push +filter-announce-msg-type+ sent))
       (values actions (nreverse sent)))))
 
 (defun stream-link-close (link)
