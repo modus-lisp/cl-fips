@@ -144,7 +144,32 @@
 
 ;;; --- node_addr / FIPS address ----------------------------------------------------
 
+(defun test-npub ()
+  ;; NIP-19's own test vectors
+  (check "npub encodes NIP-19's vector"
+         (string= (npub-encode (unhex "7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e"))
+                  "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg"))
+  (check "nsec encodes NIP-19's vector"
+         (string= (nsec-encode (unhex "67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa"))
+                  "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5"))
+  (check "nsec decodes NIP-19's vector"
+         (string= (hex (nsec-decode "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5"))
+                  "67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa"))
+  (check "npub decodes to 0x02 || x"
+         (string= (hex (npub-decode "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg"))
+                  "027e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e"))
+  (check "an upper-case npub decodes too"
+         (npub-decode (string-upcase "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg")))
+  (flet ((refused (s) (handler-case (progn (npub-decode s) nil) (error () t))))
+    (check "a one-character change is refused (checksum)"
+           (refused "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjpth"))
+    (check "mixed case is refused" (refused "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjpTg"))
+    (check "an nsec is not an npub"
+           (refused "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5"))
+    (check "a valid bech32 of the wrong length is refused" (refused (bech32-encode "npub" (unhex "0102"))))))
+
 (defun test-identity ()
+  (test-npub)
   ;; 1*G: values printed by `oracle node-addr` (upstream from_pubkey/from_node_addr).
   (let* ((g (unhex "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"))
          (na (node-addr g)))

@@ -58,6 +58,7 @@
            #:fmp-seal-frame #:fmp-open-frame #:fmp-frame-payload-len-ok-p
            ;; identity (identity.lisp)
            #:node-addr #:fips-address #:fips-address-string
+           #:bech32-encode #:bech32-decode #:npub-encode #:npub-decode #:nsec-encode #:nsec-decode
            ;; FMP link rekey (rekey.lisp)
            #:+drain-window-secs+ #:+rekey-dampening-secs+ #:+rekey-jitter-secs+
            #:rekey-config #:make-rekey-config #:rekey-config-after-secs
@@ -75,7 +76,9 @@
            ;; FMP over a byte stream (link.lisp)
            #:+default-stream-mtu+ #:link-error #:link-error-reason #:link-error-detail
            #:link-error-fatal-p #:make-byte-port #:byte-port-close #:byte-port-closed
-           #:make-datagram-port #:datagram-port-p #:+fsp-data-overhead+ #:+handshake-timeout-ms+
+           #:make-datagram-port #:datagram-port-p
+           #:stream-link-dial #:link-dial #:link-dial-p #:link-dial-port #:link-dial-receive
+           #:link-dial-tick #:link-dial-next-due-ms #:+fsp-data-overhead+ #:+handshake-timeout-ms+
            #:fmp-packet-remaining #:read-fmp-packet #:write-fmp-packet #:deadline-after-ms
            #:stream-link #:stream-link-initiate #:stream-link-accept
            #:stream-link-send #:stream-link-receive #:stream-link-close

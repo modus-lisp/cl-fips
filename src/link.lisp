@@ -245,51 +245,52 @@
    t+1, t+3, t+7, t+15 s (handshake.rs).")
 (defconstant +handshake-timeout-ms+ 30000 "handshake_timeout_secs.")
 
-(defun %await-msg2 (port hs msg1 our-index mtu timeout-ms)
-  "On a datagram port: wait for the msg2 that answers MSG1, resending MSG1 on the
-   doubling schedule, until TIMEOUT-MS (default 30 s) has passed.  Datagrams that are
-   not that answer -- malformed, another phase, another index, or a msg2 that does
-   not authenticate -- are dropped and the wait goes on.  Returns the peer's index."
-  (let* ((total (or timeout-ms +handshake-timeout-ms+))
-         (give-up (deadline-after-ms total))
-         (resend-in +msg1-first-resend-ms+)
-         (next (deadline-after-ms resend-in)))
-    (loop
-      (let* ((now (get-internal-real-time))
-             (wait (ceiling (* 1000 (max 0 (- (min next give-up) now)))
-                            internal-time-units-per-second))
-             (packet (handler-case (read-fmp-packet port :mtu mtu :timeout-ms wait)
-                       (link-error (e)
-                         (when (link-error-fatal-p e) (error e))
-                         nil))))
-        (when packet
-          (multiple-value-bind (their-index receiver-index noise-msg2) (parse-msg2 packet)
-            (when (and their-index (= receiver-index our-index)
-                       (ignore-errors (natrium.noise:ik-try-read-message-2 hs noise-msg2) t))
-              (return their-index))))
-        (let ((now (get-internal-real-time)))
-          (when (>= now give-up)
-            (link-fail port :timeout "no msg2 answered our msg1"))
-          (when (>= now next)
-            (write-fmp-packet port msg1)
-            (setf resend-in (* 2 resend-in)
-                  next (+ now (ceiling (* resend-in internal-time-units-per-second) 1000)))))))))
+(defstruct (link-dial (:constructor %make-link-dial))
+  "An IK initiation in progress: msg1 is out, msg2 not yet in."
+  port static remote local-epoch our-index hs msg1 mtu
+  timeout-ms                    ; the link's read timeout, as the caller gave it
+  give-up-ms                    ; how long the dial waits for msg2
+  rekey-config jitter-fn reports routing
+  started next-resend (resend-in +msg1-first-resend-ms+))
 
-(defun stream-link-initiate (port static remote-static-bytes local-epoch
-                             &key (our-index (random-session-index))
-                               (mtu +default-stream-mtu+) timeout-ms
-                               rekey-config jitter-fn (reports t) routing)
-  "IK initiator on PORT: write msg1, read msg2.  Returns an established STREAM-LINK.
-   REKEY-CONFIG / JITTER-FN configure the rekey machine (stock: 120 s, no
-   jitter); REPORTS selects the MMP reports STREAM-LINK-POLL emits.  On a datagram
-   port msg1 is resent until it is answered or TIMEOUT-MS (default 30 s) passes."
+(defun stream-link-dial (port static remote-static-bytes local-epoch
+                         &key (our-index (random-session-index)) (mtu +default-stream-mtu+)
+                           timeout-ms rekey-config jitter-fn (reports t) routing (now-ms 0))
+  "Start an IK initiation on PORT: build and write msg1.  Returns a LINK-DIAL, which
+   LINK-DIAL-RECEIVE completes when msg2 arrives and LINK-DIAL-TICK resends (on a
+   datagram port) or abandons.  Nothing here waits."
   (let* ((hs (fips-make-ik-initiator static remote-static-bytes local-epoch))
          (msg1 (build-msg1 our-index (natrium.noise:ik-write-message-1 hs))))
     (write-fmp-packet port msg1)
+    (%make-link-dial :port port :static static :remote remote-static-bytes
+                     :local-epoch local-epoch :our-index our-index :hs hs :msg1 msg1
+                     :mtu mtu :timeout-ms timeout-ms
+                     :give-up-ms (or timeout-ms +handshake-timeout-ms+)
+                     :rekey-config rekey-config :jitter-fn jitter-fn :reports reports
+                     :routing routing :started now-ms
+                     :next-resend (+ now-ms +msg1-first-resend-ms+))))
+
+(defun %dial-finish (dial their-index)
+  (%finish-link (link-dial-port dial) :initiator (link-dial-hs dial) (link-dial-our-index dial)
+                their-index (link-dial-mtu dial) (link-dial-timeout-ms dial) (link-dial-static dial)
+                (link-dial-local-epoch dial) (link-dial-rekey-config dial) (link-dial-jitter-fn dial)
+                (link-dial-reports dial) (link-dial-routing dial)))
+
+(defun link-dial-receive (dial &key (timeout-ms 0))
+  "Read one packet for DIAL.  Returns the established STREAM-LINK when it is the msg2
+   that answers our msg1, else NIL.  On a stream port the packet must be that msg2:
+   anything else is a fatal LINK-ERROR, as before.  On a datagram port anything else
+   is dropped (a non-fatal LINK-ERROR for a malformed datagram, NIL otherwise)."
+  (let* ((port (link-dial-port dial))
+         (mtu (link-dial-mtu dial))
+         (hs (link-dial-hs dial))
+         (our-index (link-dial-our-index dial)))
     (if (datagram-port-p port)
-        (let ((their-index (%await-msg2 port hs msg1 our-index mtu timeout-ms)))
-          (%finish-link port :initiator hs our-index their-index mtu timeout-ms
-                        static local-epoch rekey-config jitter-fn reports routing))
+        (let ((packet (read-fmp-packet port :mtu mtu :timeout-ms timeout-ms)))
+          (multiple-value-bind (their-index receiver-index noise-msg2) (parse-msg2 packet)
+            (when (and their-index (= receiver-index our-index)
+                       (ignore-errors (natrium.noise:ik-try-read-message-2 hs noise-msg2) t))
+              (%dial-finish dial their-index))))
         (let ((packet (%handshake-packet port +phase-msg2+ mtu timeout-ms)))
           (multiple-value-bind (their-index receiver-index noise-msg2) (parse-msg2 packet)
             (unless their-index (link-fail port :handshake-failed "malformed msg2"))
@@ -298,8 +299,50 @@
                          (format nil "msg2 names index ~d, ours is ~d" receiver-index our-index)))
             (%noise-or-fail (port :handshake-failed)
               (natrium.noise:ik-read-message-2 hs noise-msg2))
-            (%finish-link port :initiator hs our-index their-index mtu timeout-ms
-                          static local-epoch rekey-config jitter-fn reports routing))))))
+            (%dial-finish dial their-index))))))
+
+(defun link-dial-tick (dial now-ms)
+  "Abandon DIAL (a fatal LINK-ERROR :timeout, closing its port) once its timeout has
+   passed; on a datagram port, resend msg1 when it is due (1 s, doubling).  Returns
+   T if msg1 was resent."
+  (let ((port (link-dial-port dial)))
+    (when (>= (- now-ms (link-dial-started dial)) (link-dial-give-up-ms dial))
+      (link-fail port :timeout "no msg2 answered our msg1"))
+    (when (and (datagram-port-p port) (>= now-ms (link-dial-next-resend dial)))
+      (write-fmp-packet port (link-dial-msg1 dial))
+      (setf (link-dial-resend-in dial) (* 2 (link-dial-resend-in dial))
+            (link-dial-next-resend dial) (+ now-ms (link-dial-resend-in dial)))
+      t)))
+
+(defun link-dial-next-due-ms (dial)
+  "The time LINK-DIAL-TICK next has something to do."
+  (min (+ (link-dial-started dial) (link-dial-give-up-ms dial))
+       (if (datagram-port-p (link-dial-port dial)) (link-dial-next-resend dial) most-positive-fixnum)))
+
+(defun %clock-ms ()
+  (floor (* 1000 (get-internal-real-time)) internal-time-units-per-second))
+
+(defun stream-link-initiate (port static remote-static-bytes local-epoch
+                             &key (our-index (random-session-index))
+                               (mtu +default-stream-mtu+) timeout-ms
+                               rekey-config jitter-fn (reports t) routing)
+  "IK initiator on PORT: write msg1, read msg2.  Returns an established STREAM-LINK.
+   REKEY-CONFIG / JITTER-FN configure the rekey machine (stock: 120 s, no
+   jitter); REPORTS selects the MMP reports STREAM-LINK-POLL emits.  On a datagram
+   port msg1 is resent until it is answered or TIMEOUT-MS (default 30 s) passes.
+   This is STREAM-LINK-DIAL driven to completion, waiting on the port."
+  (let ((dial (stream-link-dial port static remote-static-bytes local-epoch
+                                :our-index our-index :mtu mtu :timeout-ms timeout-ms
+                                :rekey-config rekey-config :jitter-fn jitter-fn
+                                :reports reports :routing routing :now-ms (%clock-ms))))
+    (if (datagram-port-p port)
+        (loop
+          (let ((wait (max 0 (- (link-dial-next-due-ms dial) (%clock-ms)))))
+            (let ((link (handler-case (link-dial-receive dial :timeout-ms wait)
+                          (link-error (e) (when (link-error-fatal-p e) (error e)) nil))))
+              (when link (return link))
+              (link-dial-tick dial (%clock-ms)))))
+        (link-dial-receive dial :timeout-ms timeout-ms))))
 
 (defun stream-link-accept (port static local-epoch
                            &key (our-index (random-session-index))
