@@ -48,8 +48,14 @@
          (setup (fsp-setup-datagram fi 0))
          (sent '()) (link 'fake))
     ;; capture what B sends instead of routing it
+    #+sbcl
     (sb-int:encapsulate 'cl-fips::%node-send 'capture
                         (lambda (f node m &rest r) (declare (ignore f node r)) (push m sent) link))
+    ;; elsewhere: swap the definition by hand, put it back below
+    #-sbcl
+    (setf (get 'cl-fips::%node-send 'review-saved) (fdefinition 'cl-fips::%node-send)
+          (fdefinition 'cl-fips::%node-send)
+          (lambda (node m &rest r) (declare (ignore node r)) (push m sent) link))
     (unwind-protect
          (progn
            (cl-fips::node-local b link (subseq setup 1) 0)
@@ -63,7 +69,8 @@
            (check "R2 ... and the genuine handshake still completes"
                   (has-event (cl-fips::node-local b link (subseq (fsp-handle-ack fi (subseq (first sent) 1)) 1) 700)
                              :accepted a)))
-      (sb-int:unencapsulate 'cl-fips::%node-send 'capture))))
+      #+sbcl (sb-int:unencapsulate 'cl-fips::%node-send 'capture)
+      #-sbcl (setf (fdefinition 'cl-fips::%node-send) (get 'cl-fips::%node-send 'review-saved)))))
 
 (defun test-review-crossing ()
   (let* ((a (new-test-node)) (b (new-test-node)) (eps (connect-nodes a b)))
