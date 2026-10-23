@@ -4,6 +4,12 @@
 
 (in-package #:cl-fips.test)
 
+(defun sk (n)
+  "A pooled fixed 32-byte private key from the PUBLIC test integer N (tests only)."
+  (gossamer:pooled-copy (secp256k1-fast:int-to-bytes32 n)))
+
+(defun %as-key (k) (if (integerp k) (sk k) k))
+
 (defvar *failures* 0)
 (defvar *checks* 0)
 

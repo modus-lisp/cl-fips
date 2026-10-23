@@ -28,10 +28,11 @@
   (peers (make-hash-table :test 'equalp))   ; node -> (declaration . entries)
   (keys (make-hash-table :test 'equalp)))   ; node -> x-only key, from the handshake
 
-(defun make-tree-state (privkey-int)
-  (let* ((xonly (secp256k1-fast.schnorr:pubkey-xonly privkey-int))
+(defun make-tree-state (secret)
+  "SECRET is the node's private key: a fixed 32-byte buffer (the static keypair's)."
+  (let* ((xonly (secp256k1-fast.schnorr:pubkey-xonly secret))
          (node (subseq (natrium:sha256 xonly) 0 16)))
-    (%make-tree-state node xonly privkey-int)))
+    (%make-tree-state node xonly secret)))
 
 (defun tree-root-of (entries)
   (coord-entry-node (car (last entries))))

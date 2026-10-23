@@ -62,9 +62,10 @@
 (defun lookup-proof-bytes (request-id target coords)
   (bytes-cat (encode-u64le request-id) target (encode-coords coords)))
 
-(defun sign-lookup-proof (privkey-int request-id target coords)
+(defun sign-lookup-proof (secret request-id target coords)
+  "SECRET: the node's private key, a fixed 32-byte buffer."
   (secp256k1-fast.schnorr:schnorr-sign
-   privkey-int (natrium:sha256 (lookup-proof-bytes request-id target coords))))
+   secret (natrium:sha256 (lookup-proof-bytes request-id target coords))))
 
 (defun verify-lookup-response (r xonly)
   "T iff R's proof is the target's signature (XONLY, 32 bytes) over its id,

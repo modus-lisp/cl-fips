@@ -54,20 +54,20 @@
 
 (defun make-test-node (privkey)
   "Returns (values node-addr xonly) for a secp256k1 secret key."
-  (let* ((xonly (secp256k1-fast.schnorr:pubkey-xonly privkey))
+  (let* ((xonly (secp256k1-fast.schnorr:pubkey-xonly (%as-key privkey)))
          (node (subseq (natrium:sha256 xonly) 0 16)))
     (values node (coerce xonly '(vector (unsigned-byte 8))))))
 
 (defun signed-root-announce (privkey seq ts)
   (multiple-value-bind (node) (make-test-node privkey)
     (let ((d (make-parent-declaration node node seq ts)))
-      (sign-declaration d privkey)
+      (sign-declaration d (%as-key privkey))
       (values d (list (make-coord-entry node seq ts))))))
 
 (defun test-tree-announce ()
   (multiple-value-bind (decl entries) (signed-root-announce 3 1 1000)
     (let* ((msg (encode-tree-announce decl entries))
-           (xonly (secp256k1-fast.schnorr:pubkey-xonly 3)))
+           (xonly (secp256k1-fast.schnorr:pubkey-xonly (%as-key 3))))
       (check "TreeAnnounce layout: msg_type 0x10, version 1"
              (and (= (aref msg 0) #x10) (= (aref msg 1) 1)))
       (check "TreeAnnounce size: 1 + 99 + 32 entries" (= (length msg) (+ 1 99 32)))
@@ -94,7 +94,7 @@
                  (multiple-value-bind (d3) (decode-tree-announce bad)
                    (not (verify-declaration d3 xonly)))))
         (check "a wrong key fails verification"
-               (not (verify-declaration d2 (secp256k1-fast.schnorr:pubkey-xonly 5))))
+               (not (verify-declaration d2 (secp256k1-fast.schnorr:pubkey-xonly (%as-key 5)))))
         (check "truncated body rejected"
                (handler-case (progn (decode-tree-announce (subseq msg 1 60)) nil)
                  (error () t)))
@@ -142,13 +142,13 @@
            (not (validate-tree-semantics decl-ab (list (make-coord-entry a 1 1)))))))
 
 (defun test-tree-two-nodes ()
-  (let* ((sa (make-tree-state 3))
-         (sb (make-tree-state 5))
+  (let* ((sa (make-tree-state (sk 3)))
+         (sb (make-tree-state (sk 5)))
          (small-first (u8-less-p (tree-state-node sa) (tree-state-node sb)))
          (small (if small-first sa sb))
          (large (if small-first sb sa)))
-    (tree-register-peer-key sa (tree-state-node sb) (secp256k1-fast.schnorr:pubkey-xonly 5))
-    (tree-register-peer-key sb (tree-state-node sa) (secp256k1-fast.schnorr:pubkey-xonly 3))
+    (tree-register-peer-key sa (tree-state-node sb) (secp256k1-fast.schnorr:pubkey-xonly (%as-key 5)))
+    (tree-register-peer-key sb (tree-state-node sa) (secp256k1-fast.schnorr:pubkey-xonly (%as-key 3)))
     (tree-recompute sa 1000)
     (tree-recompute sb 1000)
     (let* ((ann-a (tree-current-announce sa))
@@ -181,7 +181,7 @@
     (let ((forged (make-parent-declaration (tree-state-node large) (tree-state-node large) 9 9)))
       (setf (parent-declaration-sig forged)
             (secp256k1-fast.schnorr:schnorr-sign
-             (if (eq large sa) 5 3) (declaration-signing-hash forged)))
+             (sk (if (eq large sa) 5 3)) (declaration-signing-hash forged)))
       (check "a forged announce is refused"
              (not (tree-observe-announce (if (eq large sa) sb sa) forged
                                          (list (make-coord-entry (tree-state-node large) 9 9))))))))
@@ -193,11 +193,11 @@
 
 (defun test-tree-forget ()
   "A forgotten peer is no longer a parent candidate."
-  (let* ((sa (make-tree-state 3)) (sb (make-tree-state 5))
+  (let* ((sa (make-tree-state (sk 3))) (sb (make-tree-state (sk 5)))
          (small (if (u8-less-p (tree-state-node sa) (tree-state-node sb)) sa sb))
          (large (if (eq small sa) sb sa))
          (small-key (if (eq small sa) 3 5)))
-    (tree-register-peer-key large (tree-state-node small) (secp256k1-fast.schnorr:pubkey-xonly small-key))
+    (tree-register-peer-key large (tree-state-node small) (secp256k1-fast.schnorr:pubkey-xonly (%as-key small-key)))
     (tree-recompute small 1000)
     (multiple-value-bind (d e) (decode-tree-announce (subseq (tree-current-announce small) 1))
       (tree-observe-announce large d e))

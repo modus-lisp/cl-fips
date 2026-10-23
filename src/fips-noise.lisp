@@ -14,13 +14,14 @@
 (in-package #:cl-fips)
 
 (defun generate-keypair ()
-  "Fresh random secp256k1 key pair from natrium's CSPRNG."
+  "Fresh random secp256k1 key pair from natrium's CSPRNG.  The secret is drawn into
+fixed scratch and lives in the keypair's pooled fixed buffer (KEYPAIR-WIPE)."
   (secp256k1-fast:secp-init)
-  (loop
-    (let* ((b (natrium:random-bytes 32))
-           (k (secp256k1-fast:bytes-to-int b)))
-      (when (< 0 k secp256k1-fast:*secp256k1-n*)
-        (return (secp256k1-fast.ecdh:keypair-from-secret b))))))
+  (gossamer:with-fixed-scratch ((b :octets 32))
+    (loop
+      (natrium:random-bytes-into b)
+      (let ((kp (ignore-errors (secp256k1-fast.ecdh:keypair-from-secret b))))
+        (when kp (return kp))))))
 
 (defun normalize-for-premessage (pubkey-bytes)
   "handshake.rs normalize_for_premessage: the compressed key with byte 0 = 0x02."
@@ -35,7 +36,8 @@
    :generate #'generate-keypair
    :public-bytes #'secp256k1-fast.ecdh:keypair-public-bytes
    :decode #'secp256k1-fast.ecdh:decode-pubkey
-   :dh #'secp256k1-fast.ecdh:noise-dh
+   :dh #'secp256k1-fast.ecdh:noise-dh            ; (keypair point out)
+   :wipe #'secp256k1-fast.ecdh:keypair-wipe      ; ephemerals are wiped after the handshake
    :premessage #'normalize-for-premessage)
   "The FIPS Noise suite.  natrium.noise knows nothing of secp256k1.")
 

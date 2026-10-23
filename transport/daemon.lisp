@@ -71,8 +71,8 @@
 (defun write-identity (path keypair)
   "Write KEYPAIR's nsec to PATH (mode 0600, as upstream's write_key_file) and its
    npub to PATH with type pub."
-  (let ((nsec (cl-fips:nsec-encode (secp256k1-fast:int-to-bytes32
-                                    (secp256k1-fast.ecdh::keypair-secret keypair)))))
+  ;; An explicit export of the secret, to the key file.
+  (let ((nsec (cl-fips:nsec-encode (secp256k1-fast.ecdh:keypair-secret keypair))))
     (with-open-file (o path :direction :output :if-exists :supersede :if-does-not-exist :create)
       (sb-posix:chmod (namestring path) #o600)
       (write-line nsec o))
@@ -91,15 +91,17 @@
   (if (probe-file path)
       (let ((line (string-trim '(#\Space #\Tab #\Return #\Newline)
                                (with-open-file (in path) (or (read-line in nil) "")))))
-        (values (secp256k1-fast.ecdh:keypair-from-secret
-                 (if (and (> (length line) 5) (string-equal "nsec1" line :end2 5))
-                     (cl-fips:nsec-decode line)
-                     (let ((v (make-array 32 :element-type '(unsigned-byte 8))))
-                       (unless (= (length line) 64) (error "~a: not an nsec or 64 hex digits" path))
-                       (dotimes (i 32 v)
-                         (setf (aref v i) (parse-integer line :start (* 2 i) :end (+ 2 (* 2 i))
-                                                              :radix 16))))))
-                nil))
+        ;; The secret arrives on the heap (a file line); it goes into fixed memory
+        ;; once, and the decoded heap copy is wiped at once.
+        (let ((raw (if (and (> (length line) 5) (string-equal "nsec1" line :end2 5))
+                       (cl-fips:nsec-decode line)
+                       (let ((v (make-array 32 :element-type '(unsigned-byte 8))))
+                         (unless (= (length line) 64) (error "~a: not an nsec or 64 hex digits" path))
+                         (dotimes (i 32 v)
+                           (setf (aref v i) (parse-integer line :start (* 2 i) :end (+ 2 (* 2 i))
+                                                                :radix 16)))))))
+          (unwind-protect (values (secp256k1-fast.ecdh:keypair-from-secret raw) nil)
+            (fill raw 0))))
       (let ((kp (cl-fips:generate-keypair)))
         (write-identity path kp)
         (values kp t))))

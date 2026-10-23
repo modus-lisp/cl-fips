@@ -78,7 +78,7 @@
 (defun write-key (path kp)
   (with-open-file (o path :direction :output :if-exists :supersede)
     (format o "~a~%~a~%"
-            (hex (secp256k1-fast:int-to-bytes32 (secp256k1-fast.ecdh::keypair-secret kp)))
+            (hex (secp256k1-fast.ecdh:keypair-secret kp))
             (hex (secp256k1-fast.ecdh:keypair-public-bytes kp)))))
 
 (defun read-key (path)

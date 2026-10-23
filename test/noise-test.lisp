@@ -185,7 +185,10 @@
   ;; DH symmetry.
   (let ((a (generate-keypair)) (b (generate-keypair)))
     (check "noise-dh symmetric"
-           (equalp (noise-dh a (keypair-public b)) (noise-dh b (keypair-public a)))))
+           (let ((x (gossamer:pooled-copy (make-array 32 :element-type '(unsigned-byte 8))))
+                 (y (gossamer:pooled-copy (make-array 32 :element-type '(unsigned-byte 8)))))
+             (noise-dh a (keypair-public b) x) (noise-dh b (keypair-public a) y)
+             (prog1 (and (equalp x y) (notevery #'zerop x)) (gossamer:free x) (gossamer:free y)))))
   ;; Lisp <-> Lisp, plus the tampered-msg1 control on the Lisp responder.
   (let* ((rs (generate-keypair))
          (i (fips-make-ik-initiator (generate-keypair) (keypair-public-bytes rs) (random-epoch)))

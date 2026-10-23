@@ -45,16 +45,16 @@
   "SHA-256 over the signing bytes: the message BIP-340 signs (node/tree.rs)."
   (natrium:sha256 (declaration-signing-bytes decl)))
 
-(defun sign-declaration (decl privkey-int)
-  "Sign DECL in place with PRIVKEY-INT.  Its node_addr must be the key's node_addr
+(defun sign-declaration (decl secret)
+  "Sign DECL in place with SECRET (a fixed 32-byte private key).  Its node_addr must be the key's node_addr
    (node/tree.rs sign_declaration refuses otherwise)."
-  (let* ((xonly (secp256k1-fast.schnorr:pubkey-xonly privkey-int))
+  (let* ((xonly (secp256k1-fast.schnorr:pubkey-xonly secret))
          (own (natrium:sha256 xonly)))
     (unless (equalp (parent-declaration-node decl) (subseq own 0 16))
       (error "declaration node ~a is not this key's node_addr"
              (parent-declaration-node decl)))
     (setf (parent-declaration-sig decl)
-          (secp256k1-fast.schnorr:schnorr-sign privkey-int (declaration-signing-hash decl)))
+          (secp256k1-fast.schnorr:schnorr-sign secret (declaration-signing-hash decl)))
     decl))
 
 (defun verify-declaration (decl xonly-pubkey)

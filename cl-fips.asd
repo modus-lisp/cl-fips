@@ -12,7 +12,7 @@
   :license "MIT"
   ;; Both are pure CL with no FFI: natrium (SHA-256, HKDF, ChaCha20-Poly1305,
   ;; CSPRNG) and secp256k1-fast (point arithmetic).
-  :depends-on ("natrium" "secp256k1-fast")
+  :depends-on ("natrium" "secp256k1-fast")   ; natrium/gossamer: the node's keys stay put
   :serial t
   :components ((:module "src" :serial t
                 :components ((:file "packages")
