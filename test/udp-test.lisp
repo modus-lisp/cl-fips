@@ -124,10 +124,9 @@
         (udp-round-trip la lb-box "U3")))))
 
 (defun raw-udp-send (to-port octets)
-  (let ((s (usocket:socket-connect "127.0.0.1" to-port :protocol :datagram
-                                                       :element-type '(unsigned-byte 8))))
-    (unwind-protect (usocket:socket-send s octets (length octets))
-      (usocket:socket-close s))))
+  (let ((ep (cl-transport.sockets:udp-open)))
+    (unwind-protect (cl-transport.sockets:udp-send ep "127.0.0.1" to-port octets)
+      (cl-transport.sockets:udp-close ep))))
 
 (defun test-udp-malformed ()
   (with-udp-pair (ea eb)

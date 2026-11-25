@@ -33,12 +33,7 @@
 (push (pathname (format nil "~a/" (or (sb-ext:posix-getenv "CL_TRANSPORT_DIR")
                                       (namestring (merge-pathnames "cl-transport" (user-homedir-pathname))))))
       asdf:*central-registry*)
-(let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
-  (when (probe-file ql) (load ql)))
-(if (find-package "QL")
-    (funcall (find-symbol "QUICKLOAD" "QL") "usocket" :silent t)
-    (asdf:load-system "usocket"))
-(asdf:load-system "cl-fips/transport")
+(asdf:load-system "cl-fips/transport")   ; its sockets are cl-transport's: no usocket
 
 (defpackage #:cl-fips.real-node (:use #:common-lisp))
 (in-package #:cl-fips.real-node)
@@ -255,8 +250,7 @@
                 (cl-fips:node-error (e)
                   (out "~6d FSP probe ~d NOT SENT: ~a" (- now t0) data-count e)))))
           ;; input
-          (when (or (listen (usocket:socket-stream sock))
-                    (usocket:wait-for-input sock :timeout 0.2 :ready-only t))
+          (when (cl-transport.sockets:wait-readable (list sock) 200)   ; buffered bytes count
             (dolist (ev (cl-fips:node-receive node link :timeout-ms 10000 :now (ms)))
               (when (eq (first ev) :frame) (pushnew (second ev) seen))
               (log-event ev t0 state)
@@ -278,16 +272,14 @@
          (epoch (natrium:random-bytes 8))
          (lnode (cl-fips:make-fips-node static))
          (listener (and (eq role :accept)
-                        (usocket:socket-listen "127.0.0.1" port :reuse-address t
-                                                                :element-type '(unsigned-byte 8))))
+                        (cl-transport.sockets:tcp-listen :host "127.0.0.1" :port port)))
          (sock (if listener
                    (progn (out "LISTENING 127.0.0.1:~d" port)
-                          (and (usocket:wait-for-input listener :timeout 60 :ready-only t)
-                               (usocket:socket-accept listener :element-type '(unsigned-byte 8))))
-                   (usocket:socket-connect "127.0.0.1" port :element-type '(unsigned-byte 8)
-                                                            :nodelay t :timeout 10)))
+                          (cl-transport.sockets:tcp-accept listener :timeout-ms 60000))
+                   ;; TCP_NODELAY is TCP-CONNECT's default
+                   (cl-transport.sockets:tcp-connect "127.0.0.1" port :timeout-secs 10)))
          (link nil))
-    (when listener (usocket:socket-close listener))
+    (when listener (cl-transport.sockets:tcp-listener-close listener))
     (unless sock (out "FAIL: the node never connected") (sb-ext:exit :code 1))
     (let ((port (cl-fips.transport:socket-byte-port sock)))
       (handler-case
@@ -348,24 +340,21 @@
          (b-addr (cl-fips:node-addr (second node-b)))
          (lnode (cl-fips:make-fips-node static))
          (tree (cl-fips:fips-node-tree lnode))
-         (s1 (usocket:socket-connect "127.0.0.1" port-a :element-type '(unsigned-byte 8)
-                                                        :nodelay t :timeout 10))
+         (s1 (cl-transport.sockets:tcp-connect "127.0.0.1" port-a :timeout-secs 10))
          (l1 (cl-fips:stream-link-initiate (cl-fips.transport:socket-byte-port s1) static
                                            (second node-a) (natrium:random-bytes 8)
                                            :timeout-ms 10000 :routing tree))
-         (listener (usocket:socket-listen "127.0.0.1" port-l :reuse-address t
-                                                             :element-type '(unsigned-byte 8)))
+         (listener (cl-transport.sockets:tcp-listen :host "127.0.0.1" :port port-l))
          (t0 (ms)) (primed nil) (local 0))
     (cl-fips:node-add-link lnode l1)
     (out "HANDSHAKE OK role=dial (to A)")
     (out "LISTENING 127.0.0.1:~d" port-l)
-    (unless (usocket:wait-for-input listener :timeout 120 :ready-only t)
-      (out "FAIL: B never dialled in") (sb-ext:exit :code 1))
-    (let* ((s2 (usocket:socket-accept listener :element-type '(unsigned-byte 8)))
+    (let* ((s2 (or (cl-transport.sockets:tcp-accept listener :timeout-ms 120000)
+                   (progn (out "FAIL: B never dialled in") (sb-ext:exit :code 1))))
            (l2 (cl-fips:stream-link-accept (cl-fips.transport:socket-byte-port s2) static
                                            (natrium:random-bytes 8) :timeout-ms 10000 :routing tree))
            (deadline (+ (ms) (* 1000 secs))))
-      (usocket:socket-close listener)
+      (cl-transport.sockets:tcp-listener-close listener)
       (cl-fips:node-add-link lnode l2)
       (out "HANDSHAKE OK role=accept (from B)")
       (loop while (< (ms) deadline) do
@@ -379,7 +368,7 @@
             (cl-fips:node-open-session lnode (second node-b) :via l1 :now now
                                                              :peer-coords (list b-addr))
             (out "~6d SessionSetup toward B sent through A" (- now t0)))
-          (dolist (sock (usocket:wait-for-input (list s1 s2) :timeout 0.1 :ready-only t))
+          (dolist (sock (cl-transport.sockets:wait-readable (list s1 s2) 100))
             (dolist (ev (cl-fips:node-receive lnode (if (eq sock s1) l1 l2) :timeout-ms 2000 :now (ms)))
               (case (first ev)
                 (:forwarded

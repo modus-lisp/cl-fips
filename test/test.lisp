@@ -75,7 +75,7 @@
       (check "fsp round trip" (and (= fl 1) (= len 40) (= ctr 7))))))
 
 (defvar *tcp-suite* nil
-  "Set by tcp-test.lisp when cl-fips/transport-test is loaded (it needs usocket).")
+  "Set by tcp-test.lisp when cl-fips/transport-test is loaded.")
 
 (defun run-all ()
   (setf *failures* 0 *checks* 0)
@@ -104,6 +104,6 @@
   (test-link-local)                     ; link-test.lisp
   (if *tcp-suite*
       (funcall *tcp-suite*)             ; tcp-test.lisp
-      (format t "  SKIPPED: TCP arms (cl-fips/transport-test not loaded; it needs usocket)~%"))
+      (format t "  SKIPPED: TCP arms (cl-fips/transport-test not loaded)~%"))
   (format t "~&~d checks, ~d failures~%" *checks* *failures*)
   (zerop *failures*))

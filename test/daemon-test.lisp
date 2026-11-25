@@ -195,18 +195,17 @@
   "Review 7: a TCP connection that never sends its msg1 does not stall the loop."
   (let* ((d (cl-fips.daemon:daemon-start
              (cl-fips.daemon:make-daemon (list :tcp (list :bind "127.0.0.1:0")) :log nil)))
-         (socks (loop repeat 5 collect (usocket:socket-connect "127.0.0.1" (cl-fips.daemon:daemon-tcp-port d)
-                                                               :element-type '(unsigned-byte 8)))))
+         (socks (loop repeat 5 collect (cl-transport.sockets:tcp-connect "127.0.0.1" (cl-fips.daemon:daemon-tcp-port d)))))
     (unwind-protect
          (progn
-           (dolist (s socks) (write-byte 1 (usocket:socket-stream s)) (finish-output (usocket:socket-stream s)))
+           (dolist (s socks) (cl-transport.sockets:tcp-write s (make-array 1 :element-type '(unsigned-byte 8) :initial-element 1)))
            (let ((t0 (now-ms)))
              (loop repeat 20 do (cl-fips.daemon:daemon-step d :max-wait-ms 10))
              (check (format nil "D8 five stalled connections do not stall the loop (~d ms for 20 steps)"
                             (- (now-ms) t0))
                     (< (- (now-ms) t0) 2000)))
            (check "D8 they are held, waiting" (= 5 (length (cl-fips.daemon::daemon-accepting d)))))
-      (dolist (s socks) (ignore-errors (usocket:socket-close s)))
+      (dolist (s socks) (cl-transport.sockets:tcp-close s))
       (cl-fips.daemon:daemon-stop d))))
 
 (defun test-daemon-crossing ()

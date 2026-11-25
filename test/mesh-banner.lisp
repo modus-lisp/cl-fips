@@ -12,7 +12,7 @@
   (push (pathname d) asdf:*central-registry*))
 (load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))
 (let ((*standard-output* (make-broadcast-stream)))
-  (ql:quickload '("usocket" "bordeaux-threads") :silent t) (asdf:load-system "cl-fips/stream"))
+  (ql:quickload '("bordeaux-threads") :silent t) (asdf:load-system "cl-fips/stream"))
 (let* ((ep (cl-fips.stream:start-fips-client
             (list :udp '(:bind "0.0.0.0:0")
                   :peers `((:npub "npub1qmc3cvfz0yu2hx96nq3gp55zdan2qclealn7xshgr448d3nh6lks7zel98"

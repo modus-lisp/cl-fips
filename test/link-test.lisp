@@ -1,7 +1,7 @@
 ;;;; link-test.lisp -- FMP stream framing and the stream link, in memory.
 ;;;;
 ;;;; No sockets: the far side of every BYTE-PORT here is a Lisp closure, so this
-;;;; file runs with CL_FIPS_NO_ORACLE=1 and without usocket.  Expected sizes are
+;;;; file runs with CL_FIPS_NO_ORACLE=1 and without any socket layer.  Expected sizes are
 ;;;; upstream's (transport/framing.rs read_fmp_packet and its unit tests), written
 ;;;; out rather than recomputed from the code under test.  Each rejection has a
 ;;;; control that differs from it in the one property being checked.

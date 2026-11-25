@@ -21,7 +21,7 @@
 (let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
   (when (probe-file ql) (load ql)))
 (let ((*standard-output* (make-broadcast-stream)))
-  (funcall (find-symbol "QUICKLOAD" "QL") '("usocket" "bordeaux-threads") :silent t)
+  (funcall (find-symbol "QUICKLOAD" "QL") '("bordeaux-threads") :silent t)
   (asdf:load-system "cl-fips/stream")
   (asdf:load-system "seal/http"))
 

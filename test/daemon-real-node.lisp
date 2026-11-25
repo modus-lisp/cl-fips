@@ -27,9 +27,6 @@
 (let ((ql (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname))))
   (when (probe-file ql) (load ql)))
 (let ((*standard-output* (make-broadcast-stream)))   ; quiet, but load ERRORS still print
-  (if (find-package "QL")
-      (funcall (find-symbol "QUICKLOAD" "QL") "usocket" :silent t)
-      (asdf:load-system "usocket"))
   (asdf:load-system "cl-fips/daemon"))
 
 (defpackage #:cl-fips.daemon-real-node (:use #:common-lisp))

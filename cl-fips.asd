@@ -51,8 +51,6 @@
                              (:file "link-test"))))
   :perform (test-op (o c) (uiop:symbol-call '#:cl-fips.test '#:run-all)))
 
-;;; The socket adapter.  Development-only: usocket on SBCL.  Nothing in src/
-;;; depends on it; it only supplies the two closures of a BYTE-PORT.
 ;;; The host adapters: UDP and TCP links over cl-transport/sockets (sb-bsd-sockets:
 ;;; SBCL and hosted modus alike).  Nothing in src/ depends on them.
 (defsystem "cl-fips/transport"
@@ -77,5 +75,5 @@
 
 (defsystem "cl-fips/transport-test"
   :description "FMP over real TCP against the upstream Rust oracle."
-  :depends-on ("cl-fips/test" "cl-fips/transport" "cl-fips/daemon" "usocket")
+  :depends-on ("cl-fips/test" "cl-fips/transport" "cl-fips/daemon")
   :components ((:module "test" :serial t :components ((:file "tcp-test") (:file "udp-test") (:file "daemon-test")))))

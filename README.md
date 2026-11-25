@@ -159,8 +159,8 @@ Not yet: IPv6 for anything but TCP.
 | `src/route.lisp` | Transit forwarding: TTL and path MTU for a SessionDatagram, the next hop from peers' filters, split horizon |
 | `src/node.lisp` | The node a program runs: its links, one shared tree, the FSP sessions it opens and accepts, and forwarding. Time is passed in, input is handed to it, and it returns events |
 | `src/identity.lisp` | `node_addr` and the FIPS IPv6 address |
-| `transport/tcp.lisp` | The TCP adapter (`usocket`, SBCL only) |
-| `transport/udp.lisp` | The UDP adapter: one socket, its datagrams sorted into per-peer ports (`usocket`, SBCL only) |
+| `transport/tcp.lisp` | The TCP adapter (`cl-transport/sockets`: SBCL and modus) |
+| `transport/udp.lisp` | The UDP adapter: one socket, its datagrams sorted into per-peer ports (`cl-transport/sockets`: SBCL and modus) |
 | `transport/fips-stream.lisp` | Byte streams between cl-fips nodes, the TCP gateway, cl-transport's `:fips` (SBCL only) |
 | `transport/daemon.lisp` | The runnable node: config, identity file, listeners, dialling and redialling peers, `daemon-send` (SBCL only) |
 | `tools/oracle/` | A Rust crate that vendors upstream's Noise and framing code, for interop tests (test tooling only) |
@@ -180,9 +180,9 @@ Not yet: IPv6 for anything but TCP.
   for the stream layer. All on [modus-lisp](https://github.com/modus-lisp).
 - **On modus**: a modus whose `sb-bsd-sockets` layer has unconnected UDP
   (sendto, recvfrom with the sender) and `sb-sys:wait-until-fd-usable`.
-- **usocket, bordeaux-threads**: the tests' raw-socket client, and the
-  stream/gateway layer (`cl-fips/stream`, SBCL only). Neither the protocol code
-  nor the node needs them.
+- **bordeaux-threads**: the stream/gateway layer (`cl-fips/stream`, SBCL only).
+  Neither the protocol code nor the node needs it.  The tests' raw-socket clients
+  are `cl-transport/sockets` too; nothing here needs usocket.
 - **cargo** (Rust), for the oracle. Only the tests need it.
 
 `run-tests.sh` and the launchers look for the pure-CL dependencies at
